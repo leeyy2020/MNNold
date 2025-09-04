@@ -57,7 +57,20 @@ public:
         x      = conv2->forward(x);
         x      = _MaxPool(x, {2, 2}, {2, 2});
         x      = _Reshape(x, {0, -1, 1, 1});
-        //auto info = x->getInfo();
+        // Insert a lightweight self-attention block before FC layers
+        // reshape to [N, seq_len, heads(=1), head_dim(=infer)]
+        const int seq_len = 64; // works well with 512 features (64*8)
+        auto xSeq = _Reshape(x, {0, seq_len, 1, -1});
+        // Build Attention op: query=key=value=xSeq
+        std::unique_ptr<MNN::OpT> attnOp(new MNN::OpT);
+        attnOp->type = MNN::OpType_Attention;
+        attnOp->main.type = MNN::OpParameter_AttentionParam;
+        attnOp->main.value = new MNN::AttentionParamT;
+        attnOp->main.AsAttentionParam()->kv_cache = false;
+        auto attnExpr = Expr::create(std::move(attnOp), {xSeq, xSeq, xSeq});
+        auto attnOut = Variable::create(attnExpr);
+        // restore to [N, C, 1, 1]
+        x      = _Reshape(attnOut, {0, -1, 1, 1});
         x      = ip1->forward(x);
         x      = ip2->forward(x);
         x      = _Convert(x, NCHW);

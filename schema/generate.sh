@@ -19,7 +19,8 @@ if [ ! -e $FLATC ]; then
   cd tmp && rm -rf *
 
   # build
-  cmake .. && cmake --build . --target flatc -- -j4
+  # Newer CMake drops compatibility with <3.5; set policy minimum to proceed
+  cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 .. && cmake --build . --target flatc -- -j4
 
   # dir recover
   popd > /dev/null

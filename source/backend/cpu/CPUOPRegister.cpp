@@ -78,6 +78,7 @@ extern void ___CPUTextureCreator__OpType_Texture__();
 #endif
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 extern void ___CPUAttentionCreator__OpType_Attention__();
+extern void ___CPUAttentionGradCreator__OpType_AttentionGrad__();
 #endif
 void registerCPUOps() {
 ___CPUCropAndResizeCreator__OpType_CropAndResize__();
@@ -157,6 +158,7 @@ ___CPUTextureCreator__OpType_Texture__();
 #endif
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 ___CPUAttentionCreator__OpType_Attention__();
+___CPUAttentionGradCreator__OpType_AttentionGrad__();
 #endif
 }
 }

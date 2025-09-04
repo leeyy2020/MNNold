@@ -1320,5 +1320,48 @@ VARP _Histogram(VARP x, int bin, int min, int max, int channel) {
     return (Variable::create(Expr::create(std::move(op), {x})));
 }
 
+VARP _Attention(VARP query, VARP key, VARP value, VARP mask, VARP sinks, bool kv_cache) {
+    flatbuffers::FlatBufferBuilder builder(MNN_DEFAULT_FLATBUFFER_SIZE);
+    AttentionParamBuilder parameter(builder);
+    parameter.add_kv_cache(kv_cache);
+    auto paOffset = parameter.Finish();
+    OpBuilder opB(builder);
+    opB.add_main(paOffset.Union());
+    opB.add_type(OpType_Attention);
+    opB.add_main_type(OpParameter_AttentionParam);
+    builder.Finish(opB.Finish());
+    std::shared_ptr<BufferStorage> extra(new BufferStorage);
+    extra->storage = builder.ReleaseRaw(extra->allocated_size, extra->offset);
+
+    std::vector<VARP> inputs = {query, key, value};
+    if (mask.get() != nullptr) {
+        inputs.push_back(mask);
+    }
+    if (sinks.get() != nullptr) {
+        inputs.push_back(sinks);
+    }
+
+    return Variable::create(Expr::create(extra, std::move(inputs), 1));
+}
+
+VARP _AttentionGrad(VARP query, VARP key, VARP value, VARP output_grad, VARP mask, VARP sinks) {
+    // Create an attention grad operation that calls the CPUAttentionGrad backend
+    std::unique_ptr<OpT> op(new OpT);
+    op->type = OpType_AttentionGrad;
+    op->main.type = OpParameter_NONE;
+    op->main.value = nullptr;
+
+    std::vector<VARP> inputs = {query, key, value, output_grad};
+    if (mask.get() != nullptr) {
+        inputs.push_back(mask);
+    }
+    if (sinks.get() != nullptr) {
+        inputs.push_back(sinks);
+    }
+
+    EXPRP expr = Expr::create(std::move(op), inputs, 3);
+    return Variable::create(expr, 0); // Return the first output (query_grad)
+}
+
 } // namespace Express
 } // namespace MNN

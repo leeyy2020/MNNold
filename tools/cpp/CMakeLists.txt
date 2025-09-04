@@ -59,6 +59,10 @@ list(APPEND MNN_CPP_TOOLS testTrain.out)
 
 add_executable(fuseTest ${CMAKE_CURRENT_LIST_DIR}/fuseTest.cpp)
 list(APPEND MNN_CPP_TOOLS fuseTest)
+
+# attention grad numeric test
+add_executable(attention_grad_test.out ${CMAKE_CURRENT_LIST_DIR}/attention_grad_test.cpp)
+list(APPEND MNN_CPP_TOOLS attention_grad_test.out)
 endif()
 
 foreach(TARGET ${MNN_CPP_TOOLS})

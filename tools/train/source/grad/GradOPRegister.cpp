@@ -30,6 +30,7 @@ extern void ___ConvGrad___create__();
 extern void ___StridedSliceGrad_cpp___create__();
 extern void ___MatrixBandPartGrad_cpp___create__();
 extern void ___ScaleGrad_cpp___create__();
+extern void ___AttentionGrad_cpp___create__();
 
 void registerGradOps() {
 ___TopKV2Grad_cpp___create__();
@@ -61,5 +62,6 @@ ___ConvGrad___create__();
 ___StridedSliceGrad_cpp___create__();
 ___MatrixBandPartGrad_cpp___create__();
 ___ScaleGrad_cpp___create__();
+___AttentionGrad_cpp___create__();
 }
 }

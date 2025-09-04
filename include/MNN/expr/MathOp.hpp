@@ -138,6 +138,8 @@ MNN_PUBLIC VARP _CumSum(VARP x, int axis, bool exclusive = false, bool reverse =
 MNN_PUBLIC VARP _CumProd(VARP x, int axis);
 MNN_PUBLIC VARPS _Svd(VARP x);
 MNN_PUBLIC VARP _Histogram(VARP x, int bin, int min, int max, int channel = -1);
+MNN_PUBLIC VARP _Attention(VARP query, VARP key, VARP value, VARP mask = nullptr, VARP sinks = nullptr, bool kv_cache = true);
+MNN_PUBLIC VARP _AttentionGrad(VARP query, VARP key, VARP value, VARP output_grad, VARP mask = nullptr, VARP sinks = nullptr);
 }; // namespace Express
 }; // namespace MNN
 

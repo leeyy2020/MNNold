@@ -180,6 +180,8 @@ enum OpType : int {
     Identity,
     PoolGrad,
     SoftmaxGrad,
+    // Gradient op for Attention
+    AttentionGrad,
     Conv2DBackPropFilter,
     TrainableParam,
     BatchNorm,
