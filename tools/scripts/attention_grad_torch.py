@@ -73,7 +73,7 @@ def attention_forward(q, k, v, do, seq_len, kv_seq_len, num_head, kv_num_head, h
     y = torch.einsum('bihj,bjhd->bihd', probs, v_full)
     # Loss = sum(y * do)
     loss = (y * do).sum()
-    return loss, (k_full, v_full, idx)
+    return loss
 
 
 def run_case(dump_dir: str, case_id: int) -> bool:
@@ -81,25 +81,13 @@ def run_case(dump_dir: str, case_id: int) -> bool:
     if not os.path.exists(prefix + 'meta.txt'):
         return False
     (seq_len, kv_seq_len, num_head, kv_num_head, head_dim), q, k, v, do = load_case(prefix)
-    loss, (k_full, v_full, idx) = attention_forward(q, k, v, do, seq_len, kv_seq_len, num_head, kv_num_head, head_dim)
-    loss.backward()
-
-    # q.grad shape matches q; k.grad, v.grad match originals
-    # Save grads in the same flat order as MNN test expects
-    write_txt(prefix + 'qg_torch.txt', q.grad.flatten().tolist())
-
-    # Accumulate grads from expanded k_full/v_full back to original k/v
-    # Build zeros grads and scatter-add from expanded head axis
-    k_grad = torch.zeros_like(k)
-    v_grad = torch.zeros_like(v)
-    # For each head h, add grad from k_full[..., h, :] to kv_h in k_grad
-    for h in range(num_head):
-        kv_h = int(idx[h].item())
-        k_grad[:, :, kv_h, :] += k_full.grad[:, :, h, :]
-        v_grad[:, :, kv_h, :] += v_full.grad[:, :, h, :]
-
-    write_txt(prefix + 'kg_torch.txt', k_grad.flatten().tolist())
-    write_txt(prefix + 'vg_torch.txt', v_grad.flatten().tolist())
+    loss = attention_forward(q, k, v, do, seq_len, kv_seq_len, num_head, kv_num_head, head_dim)
+    # Compute grads w.r.t. leaf tensors directly
+    grads = torch.autograd.grad(loss, [q, k, v], retain_graph=False, allow_unused=False)
+    qg, kg, vg = grads
+    write_txt(prefix + 'qg_torch.txt', qg.detach().flatten().tolist())
+    write_txt(prefix + 'kg_torch.txt', kg.detach().flatten().tolist())
+    write_txt(prefix + 'vg_torch.txt', vg.detach().flatten().tolist())
     print(f"[torch] Wrote grads for case {case_id}")
     return True
 
@@ -122,4 +110,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

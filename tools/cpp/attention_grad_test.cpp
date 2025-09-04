@@ -6,6 +6,7 @@
 #include <fstream>
 #include <string>
 #include <cstdlib>
+#include <sstream>
 
 #include <MNN/expr/ExprCreator.hpp>
 #include <MNN/expr/MathOp.hpp>
@@ -78,22 +79,50 @@ static bool readTxt(const std::string& path, std::vector<float>& out) {
 
 struct CaseCfg { int seq_len, kv_seq_len, num_head, kv_num_head, head_dim; };
 
+static bool parseCase(const std::string& s, CaseCfg& out) {
+    // format: seq,kv_seq,num_head,kv_num_head,head_dim
+    int a[5] = {0};
+    char ch;
+    std::stringstream ss(s);
+    if (!(ss >> a[0])) return false;
+    if (!(ss >> ch) || ch != ',') return false;
+    if (!(ss >> a[1])) return false;
+    if (!(ss >> ch) || ch != ',') return false;
+    if (!(ss >> a[2])) return false;
+    if (!(ss >> ch) || ch != ',') return false;
+    if (!(ss >> a[3])) return false;
+    if (!(ss >> ch) || ch != ',') return false;
+    if (!(ss >> a[4])) return false;
+    out = {a[0], a[1], a[2], a[3], a[4]};
+    return true;
+}
+
 int main(int argc, char** argv) {
 
     std::string dumpDir = "";
     std::string compareDir = "";
+    std::vector<CaseCfg> cases;
+    // defaults
+    cases.push_back({2,2,2,2,4});
+    cases.push_back({3,3,4,2,8});
+    cases.push_back({4,5,8,4,16});
+    cases.push_back({1,7,2,1,32});
     for (int ai = 1; ai < argc; ++ai) {
         std::string a = argv[ai];
         if (a == "--dump" && ai + 1 < argc) dumpDir = argv[++ai];
         else if (a == "--compare" && ai + 1 < argc) compareDir = argv[++ai];
+        else if (a == "--add-case" && ai + 1 < argc) {
+            CaseCfg cfg;
+            if (parseCase(argv[++ai], cfg)) cases.push_back(cfg);
+            else {
+                printf("Invalid --add-case format. Use seq,kv_seq,num_head,kv_num_head,head_dim\n");
+                return 1;
+            }
+        } else if (a == "--clear-defaults") {
+            cases.clear();
+        }
     }
 
-    std::vector<CaseCfg> cases = {
-        {2,2,2,2,4},
-        {3,3,4,2,8},
-        {4,5,8,4,16},
-        {1,7,2,1,32}
-    };
 
     float globalMaxQ=0, globalMaxK=0, globalMaxV=0; int passCnt=0;
     for (int ci = 0; ci < (int)cases.size(); ++ci) {

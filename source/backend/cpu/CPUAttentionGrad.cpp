@@ -5,9 +5,9 @@
 //  Created by MNN on 2024/03/19.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-
+#define MNN_SUPPORT_TRANSFORMER_FUSE
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
-
+#include <MNN/AutoTime.hpp>
 #include <limits>
 #include <cmath>
 #include "CPUAttentionGrad.hpp"
@@ -34,260 +34,225 @@ CPUAttentionGrad::~CPUAttentionGrad() {
 }
 
 ErrorCode CPUAttentionGrad::onResize(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
-    auto core = static_cast<CPUBackend *>(backend())->functions();
-    core->MNNGetMatMulPackMode(&eP, &lP, &hP);
-    mThreadNum = ((CPUBackend *)backend())->threadNumber();
-    unit  = core->pack;
-    bytes = core->bytes;
-    return NO_ERROR;
+auto core = static_cast<CPUBackend*>(backend())->functions();
+        core->MNNGetMatMulPackMode(&mEP, &mLP, &mHP);
+        mBytes = core->bytes;
+        if (mBytes != 4) {
+            // 仅支持 float32
+            return NOT_SUPPORT;
+        }
+        // 只需要保存基本尺寸，不再大规模分配中间矩阵
+        auto Q = inputs[0];
+        auto K = inputs[1];
+        mSeq     = Q->length(1);
+        mNumHead = Q->length(2);
+        mHeadDim = Q->length(3);
+        mKvSeq   = K->length(1);
+        mKvNumHead = K->length(2);
+        mBatch = Q->length(0);
+        mThreads = static_cast<CPUBackend*>(backend())->threadNumber();
+        return NO_ERROR;
 }
 
+
+
 ErrorCode CPUAttentionGrad::onExecute(const std::vector<Tensor*>& inputs, const std::vector<Tensor*>& outputs) {
-    // inputs: [query, key, value, output_grad, mask(optional), sinks(optional)]
-    // outputs: [query_grad, key_grad, value_grad]
-    // Debug print helper: tensor shape and f32 summary (printed once)
-    
-    auto printTensorShape = [](const Tensor* t) {
-        if (!t) { MNN_PRINT("null"); return; }
-        int dims = t->buffer().dimensions;
-        MNN_PRINT("[");
-        for (int i = 0; i < dims; ++i) {
-            MNN_PRINT("%d%s", t->buffer().dim[i].extent, (i+1<dims)?", ":"");
+    AUTOTIME;
+const Tensor* Q = inputs[0];
+        const Tensor* K = inputs[1];
+        const Tensor* V = inputs[2];
+        const Tensor* mask = nullptr;
+        const Tensor* dY   = nullptr;
+        if (inputs.size() == 5) {
+            mask = inputs[3];
+            dY   = inputs[4];
+        } else { // 4
+            dY = inputs[3];
         }
-        MNN_PRINT("]");
-    };
-    auto printF32Summary = [&](const Tensor* t, const char* name) {
-        if (!t) { MNN_PRINT("  %s: <null>\n", name); return; }
-        if (t->getType() != halide_type_of<float>()) {
-            MNN_PRINT("  %s: dtype=%d (not f32), skip\n", name, t->getType().code);
-            return;
+        Tensor* dQ = outputs[0];
+        Tensor* dK = outputs[1];
+        Tensor* dV = outputs[2];
+
+        // 清零输出
+        ::memset(dQ->host<void>(), 0, dQ->size());
+        ::memset(dK->host<void>(), 0, dK->size());
+        ::memset(dV->host<void>(), 0, dV->size());
+
+        const float* Qptr = Q->host<float>();
+        const float* Kptr = K->host<float>();
+        const float* Vptr = V->host<float>();
+        const float* dYptr = dY->host<float>();
+
+        float* dQptr = dQ->host<float>();
+        float* dKptr = dK->host<float>();
+        float* dVptr = dV->host<float>();
+
+        const bool hasMask = (mask != nullptr);
+        const bool maskIsFloat = hasMask && (mask->getType() == halide_type_of<float>());
+        const float* maskF = (hasMask && maskIsFloat) ? mask->host<float>() : nullptr;
+        const int*   maskI = (hasMask && !maskIsFloat) ? mask->host<int>() : nullptr;
+
+        const float scale = 1.0f / std::sqrt((float)mHeadDim);
+
+        // 每线程处理一段 head
+        const int tilePerThread = UP_DIV(mNumHead, mThreads);
+
+        // 线程本地缓冲：dK / dV 大小 [KV_S, KV_H, D]
+        std::vector<std::vector<float>> dK_locals(mThreads);
+        std::vector<std::vector<float>> dV_locals(mThreads);
+        for (int t = 0; t < mThreads; ++t) {
+            dK_locals[t].assign((size_t)mKvSeq * mKvNumHead * mHeadDim, 0.0f);
+            dV_locals[t].assign((size_t)mKvSeq * mKvNumHead * mHeadDim, 0.0f);
         }
-        size_t n = t->elementSize();
-        if (n == 0) { MNN_PRINT("  %s: empty\n", name); return; }
-        const float* p = t->host<float>();
-        float mn = p[0], mx = p[0], sum = 0.f;
-        size_t k = n < 16 ? n : 16;
-        for (size_t i = 0; i < n; ++i) {
-            float v = p[i];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-            sum += v;
-        }
-        float mean = sum / (float)n;
-        MNN_PRINT("  %s: shape=", name);
-        printTensorShape(t);
-        MNN_PRINT(", n=%zu, min=%.6f, max=%.6f, mean=%.6f, head=", n, mn, mx, mean);
-        for (size_t i = 0; i < k; ++i) {
-            MNN_PRINT("%s%.6f", (i==0?"":" "), p[i]);
-        }
-        if (k < n) MNN_PRINT(" ...");
-        MNN_PRINT("\n");
-    };
-    static bool sPrintedOnce = false;
-    auto query = inputs[0];
-    auto key = inputs[1];
-    auto value = inputs[2];
-    auto output_grad = inputs[3];
-    const Tensor* mask = nullptr;
-    const Tensor* sinks = nullptr;
 
-    // Shapes: query/key/value are [batch, seq_len, num_head, head_dim]
-    int seq_len = query->length(1);
-    int kv_seq_len = key->length(1);
-    mNumHead = query->length(2);
-    mHeadDim = query->length(3);
-    mKvNumHead = key->length(2);
+        MNN_CONCURRENCY_BEGIN(tId, mThreads) {
+            int hBegin = (int)tId * tilePerThread;
+            int hEnd   = std::min(hBegin + tilePerThread, mNumHead);
+            // 为每个线程循环复用的缓冲
+            std::vector<float> Khead(mKvSeq * mHeadDim);
+            std::vector<float> Vhead(mKvSeq * mHeadDim);
+            std::vector<float> dKhead(mKvSeq * mHeadDim);
+            std::vector<float> dVhead(mKvSeq * mHeadDim);
+            std::vector<float> dQhead(mSeq   * mHeadDim);
+            std::vector<float> logits(mKvSeq);
+            std::vector<float> probs(mKvSeq);
+            std::vector<float> dP(mKvSeq);
 
-    if (inputs.size() > 4) {
-        mask = inputs[4];
-    }
-    if (inputs.size() > 5) {
-        sinks = inputs[5];
-    }
+            for (int h = hBegin; h < hEnd; ++h) {
+                // 当前 head 对应的 kv_head
+                int group = std::max(1, mNumHead / std::max(1, mKvNumHead));
+                int kv_h = h / group;
+                // 提取当前 kv_head 的 K / V 切片 (layout: [kvSeq, kvHead, headDim])
+                for (int j = 0; j < mKvSeq; ++j) {
+                    const float* srcK = Kptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
+                    const float* srcV = Vptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
+                    ::memcpy(&Khead[j * mHeadDim], srcK, sizeof(float) * mHeadDim);
+                    ::memcpy(&Vhead[j * mHeadDim], srcV, sizeof(float) * mHeadDim);
+                }
+                // 清零局部梯度
+                std::fill(dKhead.begin(), dKhead.end(), 0.f);
+                std::fill(dVhead.begin(), dVhead.end(), 0.f);
+                std::fill(dQhead.begin(), dQhead.end(), 0.f);
 
-    auto query_grad = outputs[0];
-    auto key_grad = outputs[1];
-    auto value_grad = outputs[2];
+                // （可选）示例 pack：当前仅演示 pack K (与 oldMNN 接口风格一致)
+                // 实际 row-wise 逐行点积这里暂未调用 MNNPackedMatMul，
+                // 若要替换为 pack 后的一行乘法，请在 TODO 处改写。
+                // ------------------ pack K 示例 ------------------
+                // auto core = static_cast<CPUBackend*>(backend())->functions();
+                // std::vector<float> packB_K(UP_DIV(mKvSeq, mHP) * mHeadDim * mHP);
+                // core->MNNPackForMatMul_B(packB_K.data(), Khead.data(), (size_t)mHeadDim, (size_t)mKvSeq, true);
+                // ------------------------------------------------
 
-    // Initialize gradients to zero
-    ::memset(query_grad->host<char>(), 0, query_grad->size());
-    ::memset(key_grad->host<char>(), 0, key_grad->size());
-    ::memset(value_grad->host<char>(), 0, value_grad->size());
+                for (int i = 0; i < mSeq; ++i) {
+                    // 取当前 head 的 Q_i 和 dY_i
+                    const float* Qi  = Qptr  + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
+                    const float* dYi = dYptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
 
-    // Scaling as in forward: effective scale is 1/sqrt(head_dim)
-    const float mScale = 1.0f / sqrtf((float)mHeadDim);
-
-    // Parallelize over kv-head groups to avoid write conflicts on K/V grads
-    int group_size = mNumHead / mKvNumHead;
-    int tileCount = UP_DIV(mKvNumHead, mThreadNum);
-
-    // Treat tensors as float32 for gradient math (inputs are float in forward)
-    auto q_fp32 = query->host<float>();
-    auto k_fp32 = key->host<float>();
-    auto v_fp32 = value->host<float>();
-    auto og_fp32 = output_grad->host<float>();
-
-    auto qg_fp32 = query_grad->host<float>();
-    auto kg_fp32 = key_grad->host<float>();
-    auto vg_fp32 = value_grad->host<float>();
-
-    float* sinksPtr = nullptr;
-    if (sinks) {
-        sinksPtr = const_cast<float*>(sinks->host<float>());
-    }
-
-    // Helper lambdas for load/store with dtype handling
-    auto loadQ = [&](int i, int h, int d) -> float {
-        size_t idx = (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim + d;
-        return q_fp32[idx];
-    };
-    auto loadK = [&](int j, int kvh, int d) -> float {
-        size_t idx = (size_t)j * mKvNumHead * mHeadDim + (size_t)kvh * mHeadDim + d;
-        return k_fp32[idx];
-    };
-    auto loadV = [&](int j, int kvh, int d) -> float {
-        size_t idx = (size_t)j * mKvNumHead * mHeadDim + (size_t)kvh * mHeadDim + d;
-        return v_fp32[idx];
-    };
-    auto loadOG = [&](int i, int h, int d) -> float {
-        size_t idx = (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim + d;
-        return og_fp32[idx];
-    };
-    auto addQG = [&](int i, int h, int d, float v) {
-        size_t idx = (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim + d;
-        qg_fp32[idx] += v;
-    };
-    auto addKG = [&](int j, int kvh, int d, float v) {
-        size_t idx = (size_t)j * mKvNumHead * mHeadDim + (size_t)kvh * mHeadDim + d;
-        kg_fp32[idx] += v;
-    };
-    auto addVG = [&](int j, int kvh, int d, float v) {
-        size_t idx = (size_t)j * mKvNumHead * mHeadDim + (size_t)kvh * mHeadDim + d;
-        vg_fp32[idx] += v;
-    };
-
-    // Mask helpers
-    const float NEG_INF = -1e30f;
-    const bool hasMask = (mask != nullptr);
-    const bool maskIsFloat = hasMask && (mask->getType() == halide_type_of<float>());
-    const bool maskIsInt = hasMask && !maskIsFloat;
-    const float* maskF = maskIsFloat ? mask->host<float>() : nullptr;
-    const int* maskI = maskIsInt ? mask->host<int>() : nullptr;
-
-    std::function<void(int)> mCompute = [&](int tId) {
-        int kv_start = tId * tileCount;
-        int kv_end = ALIMIN(kv_start + tileCount, mKvNumHead);
-        std::vector<float> logits(kv_seq_len + 1);
-        std::vector<float> probs(kv_seq_len);
-        std::vector<float> dP(kv_seq_len);
-        for (int kv_h = kv_start; kv_h < kv_end; ++kv_h) {
-            for (int g = 0; g < group_size; ++g) {
-                int h = kv_h * group_size + g;
-                if (h >= mNumHead) break;
-                // For each token i, compute softmax row, then backprop
-                for (int i = 0; i < seq_len; ++i) {
-                    // 1) logits = mScale * Q[i,h,:] · K[j,kv_h,:] + mask
-                    for (int j = 0; j < kv_seq_len; ++j) {
+                    // 1) logits
+                    // TODO: 如需使用 pack + PackedMatMulRemain，请在此替换 dot 循环
+                    for (int j = 0; j < mKvSeq; ++j) {
+                        const float* Kj = &Khead[j * mHeadDim];
                         float dot = 0.f;
-                        // dot(Q_i_h, K_j_kvh)
+                        // 向量点积
                         for (int d = 0; d < mHeadDim; ++d) {
-                            dot += loadQ(i, h, d) * loadK(j, kv_h, d);
+                            dot += Qi[d] * Kj[d];
                         }
-                        float val = mScale * dot;
+                        float val = scale * dot;
                         if (hasMask) {
                             if (maskIsFloat) {
-                                if (mask->elementSize() == seq_len * kv_seq_len) {
-                                    val += maskF[i * kv_seq_len + j];
-                                } else {
-                                    // square mask for generation token
-                                    int offset = kv_seq_len - seq_len;
-                                    if (j >= offset) {
-                                        val += maskF[i * seq_len + (j - offset)];
-                                    }
-                                }
-                            } else { // int mask
-                                int m = maskI[i * kv_seq_len + j];
-                                if (!m) {
-                                    val = NEG_INF;
-                                }
+                                val += maskF[i * mKvSeq + j];
+                            } else {
+                                // int mask: 0 -> -inf, 非0 -> keep
+                                val = maskI[i * mKvSeq + j] ? val : -1e30f;
                             }
                         }
                         logits[j] = val;
                     }
-                    // 2) softmax over kv_seq_len (+ sink if provided)
-                    float rowMax = -std::numeric_limits<float>::infinity();
-                    for (int j = 0; j < kv_seq_len; ++j) rowMax = ALIMAX(rowMax, logits[j]);
-                    bool useSink = (sinksPtr != nullptr);
-                    float sinkVal = 0.f;
-                    if (useSink) {
-                        sinkVal = sinksPtr[h];
-                        rowMax = ALIMAX(rowMax, sinkVal);
-                    }
-                    // exp and sum
+
+                    // 2) softmax
+                    float rowMax = logits[0];
+                    for (int j = 1; j < mKvSeq; ++j) rowMax = std::max(rowMax, logits[j]);
                     float sumExp = 0.f;
-                    for (int j = 0; j < kv_seq_len; ++j) {
-                        float e = expf(logits[j] - rowMax);
-                        probs[j] = e; // store temporary as exp unnormalized
-                        sumExp += e;
+                    for (int j = 0; j < mKvSeq; ++j) {
+                        float e = std::exp(logits[j] - rowMax);
+                        probs[j] = e;
+                        sumExp  += e;
                     }
-                    if (useSink) {
-                        sumExp += expf(sinkVal - rowMax);
+                    float invSum = 1.f / std::max(sumExp, 1e-12f);
+                    for (int j = 0; j < mKvSeq; ++j) {
+                        probs[j] *= invSum;
                     }
-                    for (int j = 0; j < kv_seq_len; ++j) {
-                        probs[j] = probs[j] / sumExp;
-                    }
-                    // 3) dV += P^T @ dO_row; dP = dO_row @ V^T
-                    // dO_row
-                    // dP and dV
-                    for (int j = 0; j < kv_seq_len; ++j) {
-                        float dp = 0.f;
+
+                    // 3) dV 累加 + dP 计算
+                    // dP_j = Σ_d ( dY_i_d * V_j_d )
+                    for (int j = 0; j < mKvSeq; ++j) {
+                        const float* Vj = &Vhead[j * mHeadDim];
                         float p = probs[j];
-                        if (p == 0.f) {
-                            dP[j] = 0.f;
-                        } else {
-                            for (int d = 0; d < mHeadDim; ++d) {
-                                float dO = loadOG(i, h, d);
-                                float v = loadV(j, kv_h, d);
-                                // accumulate dV
-                                addVG(j, kv_h, d, p * dO);
-                                dp += dO * v;
-                            }
-                            dP[j] = dp;
+                        float dot_dY_V = 0.f;
+                        for (int d = 0; d < mHeadDim; ++d) {
+                            float dy = dYi[d];
+                            dVhead[j * mHeadDim + d] += p * dy; // dV 累加
+                            dot_dY_V += dy * Vj[d];
                         }
+                        dP[j] = dot_dY_V;
                     }
-                    // 4) softmax backward: dS = (dP - (dP·P_total)) ⊙ P
+
+                    // 4) softmax backward  dS_j = (dP_j - Σ_k dP_k * P_k) * P_j
                     float sum_dP_P = 0.f;
-                    for (int j = 0; j < kv_seq_len; ++j) {
+                    for (int j = 0; j < mKvSeq; ++j) {
                         sum_dP_P += dP[j] * probs[j];
                     }
-                    // 5) dQ and dK from dS
-                    for (int j = 0; j < kv_seq_len; ++j) {
+
+                    // 5) 用 dS (乘 scale) 更新 dQ_i, dK_j
+                    for (int j = 0; j < mKvSeq; ++j) {
                         float dS = (dP[j] - sum_dP_P) * probs[j];
-                        float coeff = mScale * dS;
-                        // dQ[i,h,:] += coeff * K[j,kv_h,:]
-                        // dK[j,kv_h,:] += coeff * Q[i,h,:]
-                        if (coeff != 0.f) {
-                            for (int d = 0; d < mHeadDim; ++d) {
-                                float kval = loadK(j, kv_h, d);
-                                float qval = loadQ(i, h, d);
-                                addQG(i, h, d, coeff * kval);
-                                addKG(j, kv_h, d, coeff * qval);
-                            }
+                        float coeff = dS * scale; // 链上前面的 scale
+                        if (coeff == 0.f) continue;
+                        const float* Kj = &Khead[j * mHeadDim];
+                        // dQ_i
+                        for (int d = 0; d < mHeadDim; ++d) {
+                            dQhead[i * mHeadDim + d] += coeff * Kj[d];
+                        }
+                        // dK_j
+                        for (int d = 0; d < mHeadDim; ++d) {
+                            dKhead[j * mHeadDim + d] += coeff * Qi[d];
                         }
                     }
                 } // i
-            } // g
-        } // kv_h
-    };
 
-    MNN_CONCURRENCY_BEGIN(tId, mThreadNum) {
-        mCompute((int)tId);
+                // 把局部梯度写回 / 累加
+                for (int i = 0; i < mSeq; ++i) {
+                    float* dst = dQptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
+                    ::memcpy(dst, &dQhead[i * mHeadDim], sizeof(float) * mHeadDim);
+                }
+                // 累加 dK / dV 到线程本地缓冲，避免全局竞争
+                auto& dKlocal = dK_locals[(int)tId];
+                auto& dVlocal = dV_locals[(int)tId];
+                for (int j = 0; j < mKvSeq; ++j) {
+                    float* dstK = dKlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
+                    float* dstV = dVlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
+                    for (int d = 0; d < mHeadDim; ++d) {
+                        dstK[d] += dKhead[j * mHeadDim + d];
+                        dstV[d] += dVhead[j * mHeadDim + d];
+                    }
+                }
+            } // head
+        }
+        MNN_CONCURRENCY_END();
+
+        // 线程本地缓冲归约到全局 dK / dV
+        for (int t = 0; t < mThreads; ++t) {
+            const auto& dKlocal = dK_locals[t];
+            const auto& dVlocal = dV_locals[t];
+            size_t n = (size_t)mKvSeq * mKvNumHead * mHeadDim;
+            for (size_t idx = 0; idx < n; ++idx) {
+                dKptr[idx] += dKlocal[idx];
+                dVptr[idx] += dVlocal[idx];
+            }
+        }
+
+        return NO_ERROR;
     }
-    MNN_CONCURRENCY_END();
-
-
-    return NO_ERROR;
-}
 
 bool CPUAttentionGrad::onClone(Backend* bn, const Op* op, Execution** dst) {
     if (nullptr == dst) {
