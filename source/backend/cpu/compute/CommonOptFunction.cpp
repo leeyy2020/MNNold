@@ -1178,6 +1178,46 @@ void MNNPackForMatMul_B(float* dest, const float* source, size_t h, size_t l, bo
     MNNPackC4(dest, source, l, h, offset);
 }
 
+// A simple gemm helper using MNN's packed matmul implementation.
+// Only supports non-transposed A and B matrices in float format.
+// This function demonstrates how to leverage pack technique with
+// the internal GEMM kernel for small matrix multiplications.
+void MNNSimpleGemmPack(float* C, const float* A, const float* B, size_t e, size_t l, size_t h) {
+    auto core = MNNGetCoreFunctions();
+    int eP, lP, hP;
+    core->MNNGetMatMulPackMode(&eP, &lP, &hP);
+    size_t lAlign = UP_DIV(l, lP) * lP;
+    // Pack B matrix once
+    std::vector<float> packB(UP_DIV(h, hP) * lAlign * hP);
+    core->MNNPackForMatMul_B(packB.data(), B, h, l, false);
+
+    // Temporary buffers for packed A and result tile
+    std::vector<float> packA(eP * lAlign);
+    std::vector<float> tempC(eP * UP_DIV(h, hP) * hP);
+    size_t parameters[6];
+    parameters[0] = eP * sizeof(float);
+    parameters[1] = l;
+    parameters[2] = h;
+    parameters[3] = eP * hP * sizeof(float);
+    parameters[4] = 0;
+    parameters[5] = 0;
+
+    for (int x = 0; x < e; x += eP) {
+        int xC = std::min(eP, (int)(e - x));
+        ::memset(packA.data(), 0, packA.size() * sizeof(float));
+        for (int y = 0; y < (int)l; ++y) {
+            ::memcpy(packA.data() + y * eP, A + y * e + x, xC * sizeof(float));
+        }
+        if (xC == eP) {
+            core->MNNPackedMatMul(tempC.data(), packA.data(), packB.data(), parameters, nullptr, nullptr, nullptr, nullptr);
+        } else {
+            core->MNNPackedMatMulRemain(tempC.data(), packA.data(), packB.data(), xC, parameters, nullptr, nullptr, nullptr, nullptr);
+        }
+        int area[2] = {eP, (int)e};
+        core->MNNUnpackCUnit(C + x, tempC.data(), xC, h, area);
+    }
+}
+
 static void _MNNPackedMatMulRemain(float* C, const float* A, const float* B, size_t eSize, const size_t* parameter, const float* postParameters, const float* bias, int aStride) {
     auto h = parameter[2];
     auto l = parameter[1];

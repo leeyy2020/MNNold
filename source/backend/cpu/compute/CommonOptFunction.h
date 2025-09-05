@@ -136,6 +136,12 @@ void MNNPackC4ForMatMul_A(float* destOrigin, float const** sourceGroup, const in
 
 void MNNPackForMatMul_B(float* dest, const float* source, size_t h, size_t l, bool transpose);
 
+// Simple GEMM interface using packed matmul. Only supports
+// non-transposed float matrices and is intended for small
+// utility computations where setting up a full Execution is
+// unnecessary.
+void MNNSimpleGemmPack(float* C, const float* A, const float* B, size_t e, size_t l, size_t h);
+
 // parameters: e, l, h, CStride, AStride, BStride
 void MNNPackedMatMul(float* C, const float* A, const float* B, const size_t* parameter, const float* postParameters, const float* bias, const float* k, const float* b);
 void MNNFunctionInit();
