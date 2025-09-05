@@ -10,6 +10,8 @@
 #include <MNN/AutoTime.hpp>
 #include <limits>
 #include <cmath>
+#include <algorithm>
+#include <cstring>
 #include "CPUAttentionGrad.hpp"
 #include "CPUBackend.hpp"
 #include "compute/CommonOptFunction.h"
@@ -26,6 +28,56 @@
 #endif
 
 namespace MNN {
+
+namespace {
+// Simple matrix helpers used to compute attention gradients. They avoid the
+// overhead of packing routines while still providing cache friendly access
+// patterns similar to CPUAttention.cpp.
+static inline void matMul(float* C, const float* A, const float* B, int M, int N, int K) {
+    // C[M*N] = A[M*K] * B[K*N]
+    for (int i = 0; i < M; ++i) {
+        float* cRow = C + i * N;
+        const float* aRow = A + i * K;
+        for (int k = 0; k < K; ++k) {
+            float aval = aRow[k];
+            const float* bRow = B + k * N;
+            for (int j = 0; j < N; ++j) {
+                cRow[j] += aval * bRow[j];
+            }
+        }
+    }
+}
+
+static inline void matMulABT(float* C, const float* A, const float* B, int M, int N, int K) {
+    // C[M*N] = A[M*K] * B[N*K]^T
+    for (int i = 0; i < M; ++i) {
+        float* cRow = C + i * N;
+        const float* aRow = A + i * K;
+        for (int j = 0; j < N; ++j) {
+            const float* bRow = B + j * K;
+            float sum = 0.f;
+            for (int k = 0; k < K; ++k) {
+                sum += aRow[k] * bRow[k];
+            }
+            cRow[j] = sum;
+        }
+    }
+}
+
+static inline void matMulTransA(float* C, const float* A, const float* B, int M, int N, int K) {
+    // C[M*N] = A^T(K*M) * B(K*N)
+    for (int m = 0; m < M; ++m) {
+        float* cRow = C + m * N;
+        for (int n = 0; n < N; ++n) {
+            float sum = 0.f;
+            for (int k = 0; k < K; ++k) {
+                sum += A[k * M + m] * B[k * N + n];
+            }
+            cRow[n] = sum;
+        }
+    }
+}
+} // namespace
 
 CPUAttentionGrad::CPUAttentionGrad(Backend *backend) : Execution(backend) {
 }
@@ -108,135 +160,113 @@ const Tensor* Q = inputs[0];
         MNN_CONCURRENCY_BEGIN(tId, mThreads) {
             int hBegin = (int)tId * tilePerThread;
             int hEnd   = std::min(hBegin + tilePerThread, mNumHead);
-            // 为每个线程循环复用的缓冲
+
+            std::vector<float> Qhead(mSeq * mHeadDim);
+            std::vector<float> dYhead(mSeq * mHeadDim);
             std::vector<float> Khead(mKvSeq * mHeadDim);
             std::vector<float> Vhead(mKvSeq * mHeadDim);
+            std::vector<float> logits(mSeq * mKvSeq);
+            std::vector<float> probs(mSeq * mKvSeq);
+            std::vector<float> dP(mSeq * mKvSeq);
+            std::vector<float> dQhead(mSeq * mHeadDim);
             std::vector<float> dKhead(mKvSeq * mHeadDim);
             std::vector<float> dVhead(mKvSeq * mHeadDim);
-            std::vector<float> dQhead(mSeq   * mHeadDim);
-            std::vector<float> logits(mKvSeq);
-            std::vector<float> probs(mKvSeq);
-            std::vector<float> dP(mKvSeq);
 
             for (int h = hBegin; h < hEnd; ++h) {
-                // 当前 head 对应的 kv_head
                 int group = std::max(1, mNumHead / std::max(1, mKvNumHead));
                 int kv_h = h / group;
-                // 提取当前 kv_head 的 K / V 切片 (layout: [kvSeq, kvHead, headDim])
+                // gather Q and dY for this head
+                for (int i = 0; i < mSeq; ++i) {
+                    const float* srcQ = Qptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
+                    const float* srcdY = dYptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
+                    ::memcpy(Qhead.data() + i * mHeadDim, srcQ, sizeof(float) * mHeadDim);
+                    ::memcpy(dYhead.data() + i * mHeadDim, srcdY, sizeof(float) * mHeadDim);
+                }
+                // gather K/V slice for kv head
                 for (int j = 0; j < mKvSeq; ++j) {
                     const float* srcK = Kptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
                     const float* srcV = Vptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                    ::memcpy(&Khead[j * mHeadDim], srcK, sizeof(float) * mHeadDim);
-                    ::memcpy(&Vhead[j * mHeadDim], srcV, sizeof(float) * mHeadDim);
+                    ::memcpy(Khead.data() + j * mHeadDim, srcK, sizeof(float) * mHeadDim);
+                    ::memcpy(Vhead.data() + j * mHeadDim, srcV, sizeof(float) * mHeadDim);
                 }
-                // 清零局部梯度
-                std::fill(dKhead.begin(), dKhead.end(), 0.f);
-                std::fill(dVhead.begin(), dVhead.end(), 0.f);
-                std::fill(dQhead.begin(), dQhead.end(), 0.f);
 
-                // （可选）示例 pack：当前仅演示 pack K (与 oldMNN 接口风格一致)
-                // 实际 row-wise 逐行点积这里暂未调用 MNNPackedMatMul，
-                // 若要替换为 pack 后的一行乘法，请在 TODO 处改写。
-                // ------------------ pack K 示例 ------------------
-                // auto core = static_cast<CPUBackend*>(backend())->functions();
-                // std::vector<float> packB_K(UP_DIV(mKvSeq, mHP) * mHeadDim * mHP);
-                // core->MNNPackForMatMul_B(packB_K.data(), Khead.data(), (size_t)mHeadDim, (size_t)mKvSeq, true);
-                // ------------------------------------------------
-
+                std::fill(logits.begin(), logits.end(), 0.f);
+                matMulABT(logits.data(), Qhead.data(), Khead.data(), mSeq, mKvSeq, mHeadDim);
+                // apply scale and mask
                 for (int i = 0; i < mSeq; ++i) {
-                    // 取当前 head 的 Q_i 和 dY_i
-                    const float* Qi  = Qptr  + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                    const float* dYi = dYptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-
-                    // 1) logits
-                    // TODO: 如需使用 pack + PackedMatMulRemain，请在此替换 dot 循环
+                    float* row = logits.data() + i * mKvSeq;
                     for (int j = 0; j < mKvSeq; ++j) {
-                        const float* Kj = &Khead[j * mHeadDim];
-                        float dot = 0.f;
-                        // 向量点积
-                        for (int d = 0; d < mHeadDim; ++d) {
-                            dot += Qi[d] * Kj[d];
-                        }
-                        float val = scale * dot;
+                        float val = row[j] * scale;
                         if (hasMask) {
                             if (maskIsFloat) {
                                 val += maskF[i * mKvSeq + j];
                             } else {
-                                // int mask: 0 -> -inf, 非0 -> keep
                                 val = maskI[i * mKvSeq + j] ? val : -1e30f;
                             }
                         }
-                        logits[j] = val;
+                        row[j] = val;
                     }
+                }
 
-                    // 2) softmax
-                    float rowMax = logits[0];
-                    for (int j = 1; j < mKvSeq; ++j) rowMax = std::max(rowMax, logits[j]);
-                    float sumExp = 0.f;
-                    for (int j = 0; j < mKvSeq; ++j) {
-                        float e = std::exp(logits[j] - rowMax);
-                        probs[j] = e;
-                        sumExp  += e;
-                    }
-                    float invSum = 1.f / std::max(sumExp, 1e-12f);
-                    for (int j = 0; j < mKvSeq; ++j) {
-                        probs[j] *= invSum;
-                    }
+                // softmax for each query
+                for (int i = 0; i < mSeq; ++i) {
+                    MNNSoftmax(probs.data() + i * mKvSeq, logits.data() + i * mKvSeq, mKvSeq);
+                }
 
-                    // 3) dV 累加 + dP 计算
-                    // dP_j = Σ_d ( dY_i_d * V_j_d )
-                    for (int j = 0; j < mKvSeq; ++j) {
-                        const float* Vj = &Vhead[j * mHeadDim];
-                        float p = probs[j];
-                        float dot_dY_V = 0.f;
-                        for (int d = 0; d < mHeadDim; ++d) {
-                            float dy = dYi[d];
-                            dVhead[j * mHeadDim + d] += p * dy; // dV 累加
-                            dot_dY_V += dy * Vj[d];
-                        }
-                        dP[j] = dot_dY_V;
-                    }
+                // dV = P^T * dY
+                std::fill(dVhead.begin(), dVhead.end(), 0.f);
+                matMulTransA(dVhead.data(), probs.data(), dYhead.data(), mKvSeq, mHeadDim, mSeq);
 
-                    // 4) softmax backward  dS_j = (dP_j - Σ_k dP_k * P_k) * P_j
-                    float sum_dP_P = 0.f;
-                    for (int j = 0; j < mKvSeq; ++j) {
-                        sum_dP_P += dP[j] * probs[j];
-                    }
+                // dP = dY * V^T
+                matMulABT(dP.data(), dYhead.data(), Vhead.data(), mSeq, mKvSeq, mHeadDim);
 
-                    // 5) 用 dS (乘 scale) 更新 dQ_i, dK_j
+                // softmax backward
+                for (int i = 0; i < mSeq; ++i) {
+                    float* pRow = probs.data() + i * mKvSeq;
+                    float* dRow = dP.data() + i * mKvSeq;
+                    float sum = 0.f;
                     for (int j = 0; j < mKvSeq; ++j) {
-                        float dS = (dP[j] - sum_dP_P) * probs[j];
-                        float coeff = dS * scale; // 链上前面的 scale
-                        if (coeff == 0.f) continue;
-                        const float* Kj = &Khead[j * mHeadDim];
-                        // dQ_i
-                        for (int d = 0; d < mHeadDim; ++d) {
-                            dQhead[i * mHeadDim + d] += coeff * Kj[d];
-                        }
-                        // dK_j
-                        for (int d = 0; d < mHeadDim; ++d) {
-                            dKhead[j * mHeadDim + d] += coeff * Qi[d];
-                        }
+                        sum += dRow[j] * pRow[j];
                     }
-                } // i
+                    for (int j = 0; j < mKvSeq; ++j) {
+                        dRow[j] = (dRow[j] - sum) * pRow[j];
+                    }
+                }
 
-                // 把局部梯度写回 / 累加
+                // dQ = dS * K
+                std::fill(dQhead.begin(), dQhead.end(), 0.f);
+                matMul(dQhead.data(), dP.data(), Khead.data(), mSeq, mHeadDim, mKvSeq);
+                for (float& v : dQhead) {
+                    v *= scale;
+                }
+
+                // dK = dS^T * Q
+                std::fill(dKhead.begin(), dKhead.end(), 0.f);
+                matMulTransA(dKhead.data(), dP.data(), Qhead.data(), mKvSeq, mHeadDim, mSeq);
+                for (float& v : dKhead) {
+                    v *= scale;
+                }
+
+                // write dQ
                 for (int i = 0; i < mSeq; ++i) {
                     float* dst = dQptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                    ::memcpy(dst, &dQhead[i * mHeadDim], sizeof(float) * mHeadDim);
+                    ::memcpy(dst, dQhead.data() + i * mHeadDim, sizeof(float) * mHeadDim);
                 }
-                // 累加 dK / dV 到线程本地缓冲，避免全局竞争
+
+                // accumulate dK and dV into thread local buffer
                 auto& dKlocal = dK_locals[(int)tId];
                 auto& dVlocal = dV_locals[(int)tId];
                 for (int j = 0; j < mKvSeq; ++j) {
                     float* dstK = dKlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
                     float* dstV = dVlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
+                    const float* srcK = dKhead.data() + j * mHeadDim;
+                    const float* srcV = dVhead.data() + j * mHeadDim;
                     for (int d = 0; d < mHeadDim; ++d) {
-                        dstK[d] += dKhead[j * mHeadDim + d];
-                        dstV[d] += dVhead[j * mHeadDim + d];
+                        dstK[d] += srcK[d];
+                        dstV[d] += srcV[d];
                     }
                 }
-            } // head
+            }
         }
         MNN_CONCURRENCY_END();
 
