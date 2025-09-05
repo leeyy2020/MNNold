@@ -2,39 +2,101 @@
 //  CPUAttentionGrad.hpp
 //  MNN
 //
-//  Created by MNN on 2024/03/19.
-//  Copyright © 2018, Alibaba Group Holding Limited
+//  Attention Backward (CPU, fp32)
+//  - Streaming / Head GEMM / Group GEMM execution paths
+//  - Cached packed K / V (packKT / packK / packVT)
+//  NOTE:
+//    * Only batch = 1 supported currently
+//    * Training must disable forward kv_cache for correct gradients
+//    * Float32 only
 //
-
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
-
 #ifndef CPUATTENTIONGRAD_HPP
 #define CPUATTENTIONGRAD_HPP
 
-#include <functional>
+#include <memory>
+#include <vector>
 #include "core/Execution.hpp"
-#include "core/OpCommonUtils.hpp"
 #include "MNN/ErrorCode.hpp"
+// Need CoreFunctions declaration
+#include "compute/CommonOptFunction.h"   // <-- Fix: brings in struct CoreFunctions
 
 namespace MNN {
+
+// (If you prefer to avoid the include above, you could instead forward declare:
+// struct CoreFunctions;
+// but including the header is safer in case of conditional members.)
 
 class CPUAttentionGrad : public Execution {
 public:
     CPUAttentionGrad(Backend *backend);
-    virtual ~CPUAttentionGrad();
-    virtual ErrorCode onResize(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual ErrorCode onExecute(const std::vector<Tensor *> &inputs, const std::vector<Tensor *> &outputs) override;
-    virtual bool onClone(Backend* bn, const Op* op, Execution** dst) override;
+    ~CPUAttentionGrad() override;
+
+    ErrorCode onResize(const std::vector<Tensor *> &inputs,
+                       const std::vector<Tensor *> &outputs) override;
+    ErrorCode onExecute(const std::vector<Tensor *> &inputs,
+                        const std::vector<Tensor *> &outputs) override;
+    bool onClone(Backend* bn, const Op* op, Execution** dst) override;
 
 private:
-    int mEP = 4, mLP = 1, mHP = 4, mBytes = 4;
+    // pack parameters
+    int mEP = 4, mLP = 1, mHP = 4;
+    int mBytes = 4;
+
+    // runtime / shape
     int mThreads = 1;
-    int mSeq = 0, mKvSeq = 0, mNumHead = 0, mKvNumHead = 0, mHeadDim = 0;
     int mBatch = 1;
+    int mSeq = 0, mKvSeq = 0;
+    int mNumHead = 0, mKvNumHead = 0;
+    int mHeadDim = 0;
+
+    // Packed K / V caches
+    // packKT: K^T  (h = kvSeq,   l = headDim, transpose=true)
+    // packK : K    (h = headDim, l = kvSeq,   transpose=false)
+    // packVT: V^T  (h = kvSeq,   l = headDim, transpose=true)
+    std::shared_ptr<Tensor> mPackKT;
+    std::shared_ptr<Tensor> mPackK;
+    std::shared_ptr<Tensor> mPackVT;
+    bool mPackAllocated = false;
+
+    void allocPackedKV();                       // allocate once (onResize)
+    void preparePackedKV(const Tensor* K, const Tensor* V); // fill each execution
+
+    // Execution path enum
+    enum class ExecPath {
+        Streaming,
+        HeadGemm,
+        GroupGemm
+    };
+    ExecPath selectPath() const;
+
+    // Paths
+    void executeStreaming(const Tensor* Q, const Tensor* K, const Tensor* V,
+                          const Tensor* mask, const Tensor* dY,
+                          Tensor* dQ, Tensor* dK, Tensor* dV);
+    void executeHeadGemm(const Tensor* Q, const Tensor* K, const Tensor* V,
+                         const Tensor* mask, const Tensor* dY,
+                         Tensor* dQ, Tensor* dK, Tensor* dV);
+    void executeGroupGemm(const Tensor* Q, const Tensor* K, const Tensor* V,
+                          const Tensor* mask, const Tensor* dY,
+                          Tensor* dQ, Tensor* dK, Tensor* dV);
+
+    // Utilities
+    static void packA(const float* src, int e, int l, int eP, std::vector<float>& dst);
+    struct GemmCtx {
+        int eP;
+        std::vector<float> packedOut; // hC4 * e * 4
+        std::vector<float> rowC;      // e * h
+    };
+    static void gemmApackedBpacked(const float* packAptr, int e, int l,
+                                   const float* packBptr, int h,
+                                   GemmCtx& ctx, const CoreFunctions* core);
+
+    // Thresholds (tunable)
+    static constexpr int64_t kHeadGemmThreshold  = 32 * 1024;   // seq * kv * dim
+    static constexpr int64_t kGroupGemmThreshold = 96 * 1024;   // seq * kv * dim (and groupSize > 1)
 };
 
 } // namespace MNN
-
 #endif // CPUATTENTIONGRAD_HPP
-
 #endif // MNN_SUPPORT_TRANSFORMER_FUSE
