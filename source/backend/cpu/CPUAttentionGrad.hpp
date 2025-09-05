@@ -12,6 +12,7 @@
 #define CPUATTENTIONGRAD_HPP
 
 #include <functional>
+#include <memory>
 #include "core/Execution.hpp"
 #include "core/OpCommonUtils.hpp"
 #include "MNN/ErrorCode.hpp"
@@ -31,6 +32,9 @@ private:
     int mThreads = 1;
     int mSeq = 0, mKvSeq = 0, mNumHead = 0, mKvNumHead = 0, mHeadDim = 0;
     int mBatch = 1;
+    // Pack buffers for optimization
+    std::shared_ptr<Tensor> mPackQ;
+    std::shared_ptr<Tensor> mPackK;
 };
 
 } // namespace MNN
