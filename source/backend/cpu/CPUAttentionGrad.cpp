@@ -5,7 +5,6 @@
 //  Created by MNN on 2024/03/19.
 //  Copyright © 2018, Alibaba Group Holding Limited
 //
-#define MNN_SUPPORT_TRANSFORMER_FUSE
 #ifdef MNN_SUPPORT_TRANSFORMER_FUSE
 #include <MNN/AutoTime.hpp>
 #include <limits>
@@ -160,12 +159,12 @@ const Tensor* Q = inputs[0];
                 std::fill(dVhead.begin(), dVhead.end(), 0.f);
                 std::fill(dQhead.begin(), dQhead.end(), 0.f);
 
-                // Pack K head for this attention head
+                // Pack K head for this attention head - optimized using MNNPackedMatMul
                 auto core = static_cast<CPUBackend*>(backend())->functions();
                 auto pack_k = mPackK->host<float>() + (size_t)tId * UP_DIV(mKvSeq, mHP) * mHeadDim * mHP;
                 pack_key_for_grad(Khead.data(), pack_k, mKvSeq, mHeadDim, mHP, backend());
 
-                // Pack queries one at a time for Q@K computation
+                // Process queries one at a time using optimized packed matrix multiplication
                 auto pack_q = mPackQ->host<float>() + (size_t)tId * UP_DIV(mSeq, mEP) * mHeadDim * mEP;
 
                 for (int i = 0; i < mSeq; ++i) {
@@ -173,11 +172,11 @@ const Tensor* Q = inputs[0];
                     const float* Qi  = Qptr  + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
                     const float* dYi = dYptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
 
-                    // 1) logits using packed matrix multiplication
-                    // Pack single query Qi for matmul
+                    // 1) logits using optimized packed matrix multiplication
+                    // Pack single query Qi for efficient matmul with packed K
                     pack_query_for_grad(Qi, pack_q, 1, mHeadDim, mEP);
                     
-                    // Compute Q@K^T using packed matmul
+                    // Compute Q@K^T using MNNPackedMatMulRemain (replaces manual dot product loops)
                     std::vector<float> qk_result(mKvSeq);
                     size_t shapeParameters[7] = {(size_t)mEP * sizeof(float), (size_t)mHeadDim, (size_t)mKvSeq, (size_t)1 * sizeof(float), 0, 0, 0};
                     core->MNNPackedMatMulRemain(qk_result.data(), pack_q, pack_k, 1, shapeParameters, nullptr, nullptr, nullptr, nullptr);
