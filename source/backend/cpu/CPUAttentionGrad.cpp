@@ -27,6 +27,23 @@
 
 namespace MNN {
 
+// Pack query helper function adapted from CPUAttention.cpp
+static void pack_query_for_grad(const float* query_src, float* pack_q, int seq_len, int head_dim, int eP) {
+    for (int i = 0; i < seq_len; i++) {
+        int out_index = i / eP;
+        int in_index = i % eP;
+        for (int j = 0; j < head_dim; j++) {
+            pack_q[out_index * head_dim * eP + j * eP + in_index] = query_src[i * head_dim + j];
+        }
+    }
+}
+
+// Pack key for matmul (transpose=true for K^T)
+static void pack_key_for_grad(const float* key_src, float* pack_k, int kv_seq_len, int head_dim, int hP, Backend* backend) {
+    auto core = static_cast<CPUBackend*>(backend)->functions();
+    core->MNNPackForMatMul_B(pack_k, key_src, (size_t)head_dim, (size_t)kv_seq_len, true);
+}
+
 CPUAttentionGrad::CPUAttentionGrad(Backend *backend) : Execution(backend) {
 }
 
@@ -51,6 +68,15 @@ auto core = static_cast<CPUBackend*>(backend())->functions();
         mKvNumHead = K->length(2);
         mBatch = Q->length(0);
         mThreads = static_cast<CPUBackend*>(backend())->threadNumber();
+        
+        // Allocate pack buffers for optimization
+        mPackQ.reset(Tensor::createDevice<float>({mThreads, UP_DIV(mSeq, mEP), mHeadDim, mEP}));
+        mPackK.reset(Tensor::createDevice<float>({mThreads, UP_DIV(mKvSeq, mHP), mHeadDim, mHP}));
+        backend()->onAcquireBuffer(mPackQ.get(), Backend::DYNAMIC);
+        backend()->onAcquireBuffer(mPackK.get(), Backend::DYNAMIC);
+        backend()->onReleaseBuffer(mPackQ.get(), Backend::DYNAMIC);
+        backend()->onReleaseBuffer(mPackK.get(), Backend::DYNAMIC);
+        
         return NO_ERROR;
 }
 
@@ -134,30 +160,31 @@ const Tensor* Q = inputs[0];
                 std::fill(dVhead.begin(), dVhead.end(), 0.f);
                 std::fill(dQhead.begin(), dQhead.end(), 0.f);
 
-                // （可选）示例 pack：当前仅演示 pack K (与 oldMNN 接口风格一致)
-                // 实际 row-wise 逐行点积这里暂未调用 MNNPackedMatMul，
-                // 若要替换为 pack 后的一行乘法，请在 TODO 处改写。
-                // ------------------ pack K 示例 ------------------
-                // auto core = static_cast<CPUBackend*>(backend())->functions();
-                // std::vector<float> packB_K(UP_DIV(mKvSeq, mHP) * mHeadDim * mHP);
-                // core->MNNPackForMatMul_B(packB_K.data(), Khead.data(), (size_t)mHeadDim, (size_t)mKvSeq, true);
-                // ------------------------------------------------
+                // Pack K head for this attention head
+                auto core = static_cast<CPUBackend*>(backend())->functions();
+                auto pack_k = mPackK->host<float>() + (size_t)tId * UP_DIV(mKvSeq, mHP) * mHeadDim * mHP;
+                pack_key_for_grad(Khead.data(), pack_k, mKvSeq, mHeadDim, mHP, backend());
+
+                // Pack queries one at a time for Q@K computation
+                auto pack_q = mPackQ->host<float>() + (size_t)tId * UP_DIV(mSeq, mEP) * mHeadDim * mEP;
 
                 for (int i = 0; i < mSeq; ++i) {
                     // 取当前 head 的 Q_i 和 dY_i
                     const float* Qi  = Qptr  + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
                     const float* dYi = dYptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
 
-                    // 1) logits
-                    // TODO: 如需使用 pack + PackedMatMulRemain，请在此替换 dot 循环
+                    // 1) logits using packed matrix multiplication
+                    // Pack single query Qi for matmul
+                    pack_query_for_grad(Qi, pack_q, 1, mHeadDim, mEP);
+                    
+                    // Compute Q@K^T using packed matmul
+                    std::vector<float> qk_result(mKvSeq);
+                    size_t shapeParameters[7] = {(size_t)mEP * sizeof(float), (size_t)mHeadDim, (size_t)mKvSeq, (size_t)1 * sizeof(float), 0, 0, 0};
+                    core->MNNPackedMatMulRemain(qk_result.data(), pack_q, pack_k, 1, shapeParameters, nullptr, nullptr, nullptr, nullptr);
+                    
+                    // Apply scale and mask
                     for (int j = 0; j < mKvSeq; ++j) {
-                        const float* Kj = &Khead[j * mHeadDim];
-                        float dot = 0.f;
-                        // 向量点积
-                        for (int d = 0; d < mHeadDim; ++d) {
-                            dot += Qi[d] * Kj[d];
-                        }
-                        float val = scale * dot;
+                        float val = scale * qk_result[j];
                         if (hasMask) {
                             if (maskIsFloat) {
                                 val += maskF[i * mKvSeq + j];
