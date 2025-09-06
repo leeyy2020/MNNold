@@ -68,16 +68,9 @@ private:
         HeadGemm,
         GroupGemm
     };
-    ExecPath selectPath() const;
 
     // Paths
     void executeStreaming(const Tensor* Q, const Tensor* K, const Tensor* V,
-                          const Tensor* mask, const Tensor* dY,
-                          Tensor* dQ, Tensor* dK, Tensor* dV);
-    void executeHeadGemm(const Tensor* Q, const Tensor* K, const Tensor* V,
-                         const Tensor* mask, const Tensor* dY,
-                         Tensor* dQ, Tensor* dK, Tensor* dV);
-    void executeGroupGemm(const Tensor* Q, const Tensor* K, const Tensor* V,
                           const Tensor* mask, const Tensor* dY,
                           Tensor* dQ, Tensor* dK, Tensor* dV);
 

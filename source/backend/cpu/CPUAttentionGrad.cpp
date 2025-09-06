@@ -58,6 +58,7 @@ static inline void axpyVec4(float* __restrict dst, const float* __restrict src, 
 // ============== pack A (e rows, l cols) ==============
 void CPUAttentionGrad::packA(const float* src, int e, int l, int eP, std::vector<float>& dst) {
     int blocks = UP_DIV(e, eP);
+    dst.resize((size_t)blocks * l * eP);
     for (int b = 0; b < blocks; ++b) {
         int rs = b * eP;
         int realE = std::min(eP, e - rs);
@@ -88,42 +89,53 @@ static void unpackPackedC(const float* packedC, int e, int h, int cStrideFloat, 
 }
 
 // ============== GEMM wrapper ==============
+static inline void unpackC_unit(const float* packC, int e, int h, int unit, float* outRowMajor) {
+    // packC layout: [h/unit, e, unit]
+    for (int i = 0; i < e; ++i) {
+        const float* rowBase = packC + (size_t)i * unit;
+        for (int col = 0; col < h; ++col) {
+            int ob = col / unit;
+            int oi = col % unit;
+            outRowMajor[(size_t)i * h + col] = rowBase[ob * (size_t)e * unit + oi];
+        }
+    }
+}
+
 void CPUAttentionGrad::gemmApackedBpacked(const float* packAptr, int e, int l,
                                           const float* packBptr, int h,
                                           GemmCtx& ctx, const CoreFunctions* core) {
     if (e <= 0 || l <= 0 || h <= 0) return;
+    const int unit = core->pack;
+    const int bytes = core->bytes;
+    // parameters: e(tile in bytes), l, h, CStride(bytes), AStride, BStride
     size_t param[7] = {
-        (size_t)ctx.eP * sizeof(float),
+        (size_t)ctx.eP * (size_t)bytes,
         (size_t)l,
         (size_t)h,
-        (size_t)(e * 4 * sizeof(float)),
+        (size_t)(e * unit * bytes),
         0,0,0
     };
-    int hC4 = UP_DIV(h, 4);
-    size_t need = (size_t)hC4 * e * 4;
+    // C packed layout: [h/unit, e, unit]
+    size_t need = (size_t)UP_DIV(h, unit) * (size_t)e * (size_t)unit;
     if (ctx.packedOut.size() < need) ctx.packedOut.assign(need, 0.f);
     else std::fill(ctx.packedOut.begin(), ctx.packedOut.begin() + need, 0.f);
 
     int full = e / ctx.eP;
     int remain = e % ctx.eP;
+    // full tiles
     for (int b = 0; b < full; ++b) {
-        param[6] = (b == 0 ? 0 : 1);
-        core->MNNPackedMatMulRemain(ctx.packedOut.data(),
-                                    packAptr + b * l * ctx.eP,
-                                    packBptr,
-                                    ctx.eP,
-                                    param, nullptr,nullptr,nullptr,nullptr);
+        float* Cblk = ctx.packedOut.data() + (size_t)b * ctx.eP * unit;
+        const float* Ablk = packAptr + (size_t)b * l * ctx.eP;
+        core->MNNPackedMatMul(Cblk, Ablk, packBptr, param, nullptr, nullptr, nullptr, nullptr);
     }
+    // remain tile
     if (remain) {
-        param[6] = (full == 0 ? 0 : 1);
-        core->MNNPackedMatMulRemain(ctx.packedOut.data(),
-                                    packAptr + full * l * ctx.eP,
-                                    packBptr,
-                                    remain,
-                                    param, nullptr,nullptr,nullptr,nullptr);
+        float* Cblk = ctx.packedOut.data() + (size_t)full * ctx.eP * unit;
+        const float* Ablk = packAptr + (size_t)full * l * ctx.eP;
+        core->MNNPackedMatMulRemain(Cblk, Ablk, packBptr, (size_t)remain, param, nullptr, nullptr, nullptr, nullptr);
     }
     if ((int)ctx.rowC.size() < e * h) ctx.rowC.resize((size_t)e * h);
-    unpackPackedC(ctx.packedOut.data(), e, h, e * 4, ctx.rowC.data());
+    unpackC_unit(ctx.packedOut.data(), e, h, unit, ctx.rowC.data());
 }
 
 // ============== ctor / resize ==============
@@ -134,9 +146,11 @@ CPUAttentionGrad::~CPUAttentionGrad() = default;
 
 void CPUAttentionGrad::allocPackedKV() {
     if (mPackAllocated) return;
-    mPackKT.reset(Tensor::createDevice<float>({mKvNumHead, UP_DIV(mKvSeq,4), mHeadDim, 4}));
-    mPackK .reset(Tensor::createDevice<float>({mKvNumHead, UP_DIV(mHeadDim,4), mKvSeq, 4}));
-    mPackVT.reset(Tensor::createDevice<float>({mKvNumHead, UP_DIV(mKvSeq,4), mHeadDim, 4}));
+    auto core = static_cast<CPUBackend*>(backend())->functions();
+    int unit = core->pack;
+    mPackKT.reset(Tensor::createDevice<float>({mKvNumHead, UP_DIV(mKvSeq,unit), mHeadDim, unit}));
+    mPackK .reset(Tensor::createDevice<float>({mKvNumHead, UP_DIV(mHeadDim,unit), mKvSeq, unit}));
+    mPackVT.reset(Tensor::createDevice<float>({mKvNumHead, UP_DIV(mKvSeq,unit), mHeadDim, unit}));
     backend()->onAcquireBuffer(mPackKT.get(), Backend::DYNAMIC);
     backend()->onAcquireBuffer(mPackK .get(), Backend::DYNAMIC);
     backend()->onAcquireBuffer(mPackVT.get(), Backend::DYNAMIC);
@@ -163,7 +177,9 @@ ErrorCode CPUAttentionGrad::onResize(const std::vector<Tensor*>& inputs,
     MNN_ASSERT(mBatch == 1);
     MNN_ASSERT(mKvNumHead > 0);
     MNN_ASSERT(mNumHead % mKvNumHead == 0);
-    printf("mSeq %d mNumHead %d mHeadDim %d mKvSeq %d\n", mSeq, mNumHead, mHeadDim, mKvSeq);
+    fprintf(stderr, "[Grad:onResize] mSeq=%d mNumHead=%d mHeadDim=%d mKvSeq=%d kvHead=%d eP=%d pack=%d\n",
+            mSeq, mNumHead, mHeadDim, mKvSeq, mKvNumHead, mEP, core->pack);
+    fflush(stderr);
     mThreads = static_cast<CPUBackend*>(backend())->threadNumber();
     allocPackedKV();
     return NO_ERROR;
@@ -182,38 +198,74 @@ void CPUAttentionGrad::preparePackedKV(const Tensor* K, const Tensor* V) {
             ::memcpy(Kbuf.data() + j * mHeadDim, Ks, mHeadDim * sizeof(float));
             ::memcpy(Vbuf.data() + j * mHeadDim, Vs, mHeadDim * sizeof(float));
         }
+        int unit = core->pack;
         float* packKTHead = mPackKT->host<float>() +
-            (size_t)kv_h * UP_DIV(mKvSeq,4) * mHeadDim * 4;
+            (size_t)kv_h * UP_DIV(mKvSeq,unit) * mHeadDim * unit;
         float* packKHead  = mPackK ->host<float>() +
-            (size_t)kv_h * UP_DIV(mHeadDim,4) * mKvSeq * 4;
+            (size_t)kv_h * UP_DIV(mHeadDim,unit) * mKvSeq * unit;
         float* packVTHead = mPackVT->host<float>() +
-            (size_t)kv_h * UP_DIV(mKvSeq,4) * mHeadDim * 4;
+            (size_t)kv_h * UP_DIV(mKvSeq,unit) * mHeadDim * unit;
+        // Debug sanity (optional):
+        // fprintf(stderr, "[Grad] packKV kv_h=%d unit=%d\n", kv_h, unit);
+        // For Q@K^T and dY@V^T we need B with shape (l x h) = (head_dim x kv_seq),
+        // while source is [kv_seq x head_dim], so use transpose=true
         core->MNNPackForMatMul_B(packKTHead, Kbuf.data(), (size_t)mKvSeq, (size_t)mHeadDim, true);
-        core->MNNPackForMatMul_B(packKHead,  Kbuf.data(), (size_t)mHeadDim, (size_t)mKvSeq, false);
         core->MNNPackForMatMul_B(packVTHead, Vbuf.data(), (size_t)mKvSeq, (size_t)mHeadDim, true);
+        // For dQ = dS @ K we need B with (l = kv_seq, h = head_dim), and source Kbuf is [kv_seq x head_dim]
+        // which matches (l x h), so transpose=false with (h=head_dim, l=kv_seq)
+        core->MNNPackForMatMul_B(packKHead,  Kbuf.data(), (size_t)mHeadDim, (size_t)mKvSeq, false);
     }
 }
 
-// ============== Path selection ==============
-CPUAttentionGrad::ExecPath CPUAttentionGrad::selectPath() const {
-    int64_t problem = (int64_t)mSeq * mKvSeq * mHeadDim;
-    int groupSize = mNumHead / mKvNumHead;
-    if (groupSize > 1 && problem >= kGroupGemmThreshold) return ExecPath::GroupGemm;
-    if (problem >= kHeadGemmThreshold) return ExecPath::HeadGemm;
-    return ExecPath::Streaming;
-}
+
 
 // ============== Streaming path (unchanged core logic) ==============
+// Pack A for the transposed view: given src [E x L] row-major, pack rows of A'=[L x E]
+static void packATranspose(const float* src, int E, int L, int eP, std::vector<float>& dst) {
+    int blocks = UP_DIV(L, eP); // rows' = L
+    dst.resize((size_t)blocks * E * eP);
+    for (int b = 0; b < blocks; ++b) {
+        int rs = b * eP;
+        int realE = std::min(eP, L - rs);
+        float* base = dst.data() + (size_t)b * E * eP;
+        for (int col = 0; col < E; ++col) {
+            for (int r = 0; r < realE; ++r) {
+                base[col * eP + r] = src[(size_t)col * L + (rs + r)];
+            }
+            for (int r = realE; r < eP; ++r) base[col * eP + r] = 0.f;
+        }
+    }
+}
+
+// Gather one head plane into a contiguous [seq x dim] buffer from NHWC-like layout
+static void gatherHeadContig(const float* src, int seq, int numHead, int dim, int h, std::vector<float>& dst) {
+    dst.resize((size_t)seq * dim);
+    for (int i = 0; i < seq; ++i) {
+        const float* s = src + (size_t)i * numHead * dim + (size_t)h * dim;
+        ::memcpy(dst.data() + (size_t)i * dim, s, (size_t)dim * sizeof(float));
+    }
+}
+
+// Gather K/V one kv-head into contiguous [kv_seq x dim] buffer from NHWC-like layout
+static void gatherKVHeadContig(const float* src, int kvSeq, int kvNumHead, int dim, int kv_h, std::vector<float>& dst) {
+    dst.resize((size_t)kvSeq * dim);
+    for (int j = 0; j < kvSeq; ++j) {
+        const float* s = src + (size_t)j * kvNumHead * dim + (size_t)kv_h * dim;
+        ::memcpy(dst.data() + (size_t)j * dim, s, (size_t)dim * sizeof(float));
+    }
+}
+
 void CPUAttentionGrad::executeStreaming(const Tensor* Q, const Tensor* K, const Tensor* V,
                                         const Tensor* mask, const Tensor* dY,
                                         Tensor* dQ, Tensor* dK, Tensor* dV) {
+    auto core = static_cast<CPUBackend*>(backend())->functions();
     auto Qptr  = Q->host<float>();
-    auto Kptr  = K->host<float>();
-    auto Vptr  = V->host<float>();
     auto dYptr = dY->host<float>();
     auto dQptr = dQ->host<float>();
     auto dKptr = dK->host<float>();
     auto dVptr = dV->host<float>();
+    // Ensure packed K/V ready
+    preparePackedKV(K, V);
 
     bool hasMask = (mask != nullptr);
     bool maskIsFloat = hasMask && (mask->getType() == halide_type_of<float>());
@@ -224,106 +276,162 @@ void CPUAttentionGrad::executeStreaming(const Tensor* Q, const Tensor* K, const 
     int groupSize = mNumHead / mKvNumHead;
     size_t kvAllSize = (size_t)mKvSeq * mKvNumHead * mHeadDim;
 
+    // thread local accumulators for dK/dV
     std::vector<std::vector<float>> dK_locals(mThreads);
     std::vector<std::vector<float>> dV_locals(mThreads);
     for (int t = 0; t < mThreads; ++t) {
         dK_locals[t].assign(kvAllSize, 0.f);
         dV_locals[t].assign(kvAllSize, 0.f);
     }
+
     int headsPerThread = UP_DIV(mNumHead, mThreads);
 
     MNN_CONCURRENCY_BEGIN(tId, mThreads) {
         int hStart = (int)tId * headsPerThread;
         int hEnd   = std::min(hStart + headsPerThread, mNumHead);
-        if (hStart >= hEnd) { }
-        else {
+        if (hStart >= hEnd) {
+            // nothing
+        } else {
             auto& dKlocal = dK_locals[(int)tId];
             auto& dVlocal = dV_locals[(int)tId];
 
-            std::vector<float> Kcache(mKvSeq * mHeadDim);
-            std::vector<float> Vcache(mKvSeq * mHeadDim);
-            int lastKvH = -1;
+            // Allocate reusable buffers per thread
+            CPUAttentionGrad::GemmCtx ctxQK{mEP}, ctxDP{mEP}, ctxDQ{mEP};
+            std::vector<float> packA_buf;            // generic A pack buffer
+            std::vector<float> packA_tr_buf;         // A pack buffer for transposed view
 
-            std::vector<float> logits(mKvSeq);
-            std::vector<float> probs (mKvSeq);
-            std::vector<float> dP    (mKvSeq);
-            std::vector<float> dS    (mKvSeq);
-            std::vector<float> dQ_head(mSeq * mHeadDim);
-            std::vector<float> dK_head(mKvSeq * mHeadDim);
-            std::vector<float> dV_head(mKvSeq * mHeadDim);
+            // B packed buffers for Q and dY when needed
+            std::vector<float> packB_Q;
+            std::vector<float> packB_dY;
 
+            // Loop heads for this thread
             for (int h = hStart; h < hEnd; ++h) {
                 int kv_h = h / groupSize;
-                if (kv_h != lastKvH) {
-                    for (int j = 0; j < mKvSeq; ++j) {
-                        const float* Ks = Kptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                        const float* Vs = Vptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                        ::memcpy(Kcache.data() + j * mHeadDim, Ks, mHeadDim * sizeof(float));
-                        ::memcpy(Vcache.data() + j * mHeadDim, Vs, mHeadDim * sizeof(float));
-                    }
-                    lastKvH = kv_h;
-                }
-                std::fill(dQ_head.begin(), dQ_head.end(), 0.f);
-                std::fill(dK_head.begin(), dK_head.end(), 0.f);
-                std::fill(dV_head.begin(), dV_head.end(), 0.f);
 
+                // pointers to packed K/V for this kv head
+                int unit = core->pack;
+                const float* packKTHead = mPackKT->host<float>() +
+                    (size_t)kv_h * UP_DIV(mKvSeq,unit) * mHeadDim * unit;
+                const float* packKHead  = mPackK ->host<float>() +
+                    (size_t)kv_h * UP_DIV(mHeadDim,unit) * mKvSeq * unit;
+                const float* packVTHead = mPackVT->host<float>() +
+                    (size_t)kv_h * UP_DIV(mKvSeq,unit) * mHeadDim * unit;
+
+                // View slices for this head
+                std::vector<float> Q_head_c; // [seq x dim]
+                std::vector<float> dY_head_c; // [seq x dim]
+                gatherHeadContig(Qptr, mSeq, mNumHead, mHeadDim, h, Q_head_c);
+                gatherHeadContig(dYptr, mSeq, mNumHead, mHeadDim, h, dY_head_c);
+
+                // 1) logits = Q @ K^T via GEMM (after packA fix)
+                packA(Q_head_c.data(), mSeq, mHeadDim, mEP, packA_buf);
+                gemmApackedBpacked(packA_buf.data(), mSeq, mHeadDim, packKTHead, mKvSeq, ctxQK, core);
+                float* P = ctxQK.rowC.data();
+
+                // Apply scale + mask, then softmax row-wise
+                std::vector<float> rowBuf(mKvSeq);
                 for (int i = 0; i < mSeq; ++i) {
-                    const float* Qi  = Qptr  + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                    const float* dYi = dYptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                    float* dQi = dQ_head.data() + i * mHeadDim;
-
-                    // logits
+                    float* row = P + (size_t)i * mKvSeq;
                     for (int j = 0; j < mKvSeq; ++j) {
-                        float val = scale * dotVec4(Qi, Kcache.data() + j * mHeadDim, mHeadDim);
+                        float v = row[j] * scale;
                         if (hasMask) {
-                            if (maskIsFloat) val += maskF[i * mKvSeq + j];
-                            else val = maskI[i * mKvSeq + j] ? val : -1e30f;
+                            if (maskIsFloat) v += maskF[i * mKvSeq + j];
+                            else v = maskI[i * mKvSeq + j] ? v : -1e30f;
                         }
-                        logits[j] = val;
+                        rowBuf[j] = v;
                     }
-                    // softmax
-                    MNNSoftmax(probs.data(), logits.data(), (size_t)mKvSeq);
-
-                    // dV & dP
-                    for (int j = 0; j < mKvSeq; ++j) {
-                        const float* Vj = Vcache.data() + j * mHeadDim;
-                        float dp = dotVec4(dYi, Vj, mHeadDim);
-                        dP[j] = dp;
-                        axpyVec4(dV_head.data() + j * mHeadDim, dYi, probs[j], mHeadDim);
-                    }
-                    // dS
-                    float sum_dP_P = 0.f;
-                    for (int j = 0; j < mKvSeq; ++j) sum_dP_P += dP[j] * probs[j];
-                    for (int j = 0; j < mKvSeq; ++j) dS[j] = (dP[j] - sum_dP_P) * probs[j];
-
-                    // dQ & dK
-                    for (int j = 0; j < mKvSeq; ++j) {
-                        float coeff = dS[j] * scale;
-                        if (coeff == 0.f) continue;
-                        const float* Kj = Kcache.data() + j * mHeadDim;
-                        axpyVec4(dQi, Kj, coeff, mHeadDim);
-                        axpyVec4(dK_head.data() + j * mHeadDim, Qi, coeff, mHeadDim);
-                    }
+                    MNNSoftmax(row, rowBuf.data(), (size_t)mKvSeq);
                 }
 
-                // write dQ
+                // 2) dP = dY @ V^T via GEMM
+                packA(dY_head_c.data(), mSeq, mHeadDim, mEP, packA_buf);
+                gemmApackedBpacked(packA_buf.data(), mSeq, mHeadDim, packVTHead, mKvSeq, ctxDP, core);
+                float* dP = ctxDP.rowC.data();
+
+                // 3) dS = (dP - (dP ⊙ P)1) ⊙ P ; in-place overwrite dP (use double accumulator for better precision)
                 for (int i = 0; i < mSeq; ++i) {
-                    float* dst = dQptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                    ::memcpy(dst, dQ_head.data() + i * mHeadDim, mHeadDim * sizeof(float));
+                    float* pRow  = P  + (size_t)i * mKvSeq;
+                    float* dpRow = dP + (size_t)i * mKvSeq;
+                    double sum_dp_p = 0.0;
+                    for (int j = 0; j < mKvSeq; ++j) sum_dp_p += (double)dpRow[j] * (double)pRow[j];
+                    float s = (float)sum_dp_p;
+                    for (int j = 0; j < mKvSeq; ++j) dpRow[j] = (dpRow[j] - s) * pRow[j];
                 }
-                // accumulate dK/dV
-                for (int j = 0; j < mKvSeq; ++j) {
-                    float* dstK = dKlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                    float* dstV = dVlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                    axpyVec4(dstK, dK_head.data() + j * mHeadDim, 1.f, mHeadDim);
-                    axpyVec4(dstV, dV_head.data() + j * mHeadDim, 1.f, mHeadDim);
+                float* dS = dP; // alias
+
+                // 4) dQ = (dS * scale) @ K via GEMM (pre-scale dS to reduce rounding error)
+                std::vector<float> dS_scaled((size_t)mSeq * mKvSeq);
+                for (int i = 0; i < mSeq; ++i) {
+                    float* rowS = dS_scaled.data() + (size_t)i * mKvSeq;
+                    float* rowD = dP + (size_t)i * mKvSeq; // alias dS
+                    for (int j = 0; j < mKvSeq; ++j) rowS[j] = rowD[j] * scale;
                 }
-            }
+                packA(dS_scaled.data(), mSeq, mKvSeq, mEP, packA_buf);
+                {
+                    gemmApackedBpacked(packA_buf.data(), mSeq, mKvSeq, packKHead, mHeadDim, ctxDQ, core);
+                    for (int i = 0; i < mSeq; ++i) {
+                        float* src = ctxDQ.rowC.data() + (size_t)i * mHeadDim;
+                        float* dst = dQptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
+                        ::memcpy(dst, src, (size_t)mHeadDim * sizeof(float));
+                    }
+                }
+
+                // Prepare packed B for dV / dK once
+                // Pack B = dY_head (seq x dim) as (l=seq, h=dim), source already (l x h), transpose=false
+                {
+                    int pack = core->pack;
+                    size_t need = (size_t)UP_DIV(mHeadDim, pack) * (size_t)mSeq * pack;
+                    packB_dY.resize(need);
+                    core->MNNPackForMatMul_B(packB_dY.data(),
+                                              dY_head_c.data(),
+                                              (size_t)mHeadDim, (size_t)mSeq, false);
+                }
+                // Pack B = Q_head (seq x dim) as (l=seq, h=dim)
+                {
+                    int pack = core->pack;
+                    size_t need = (size_t)UP_DIV(mHeadDim, pack) * (size_t)mSeq * pack;
+                    packB_Q.resize(need);
+                    core->MNNPackForMatMul_B(packB_Q.data(),
+                                              Q_head_c.data(),
+                                              (size_t)mHeadDim, (size_t)mSeq, false);
+                }
+
+                // 5) dV = P^T @ dY via GEMM（显式转置稳定版本）
+                {
+                    std::vector<float> P_tr((size_t)mKvSeq * mSeq);
+                    for (int i = 0; i < mSeq; ++i) {
+                        const float* prow = P + (size_t)i * mKvSeq;
+                        for (int j = 0; j < mKvSeq; ++j) {
+                            P_tr[(size_t)j * mSeq + i] = prow[j];
+                        }
+                    }
+                    packA(P_tr.data(), mKvSeq, mSeq, mEP, packA_tr_buf);
+                    CPUAttentionGrad::GemmCtx ctxDV{mEP};
+                    gemmApackedBpacked(packA_tr_buf.data(), mKvSeq, mSeq, packB_dY.data(), mHeadDim, ctxDV, core);
+                    for (int j = 0; j < mKvSeq; ++j) {
+                        float* dstV = dVlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
+                        const float* src = ctxDV.rowC.data() + (size_t)j * mHeadDim;
+                        for (int d = 0; d < mHeadDim; ++d) dstV[d] += src[d];
+                    }
+                }
+
+                // 6) dK = dS^T @ Q via GEMM（分块 packATranspose）
+                packATranspose(dS, mSeq, mKvSeq, mEP, packA_tr_buf);
+                {
+                    CPUAttentionGrad::GemmCtx ctxDK{mEP};
+                    gemmApackedBpacked(packA_tr_buf.data(), mKvSeq, mSeq, packB_Q.data(), mHeadDim, ctxDK, core);
+                    for (int j = 0; j < mKvSeq; ++j) {
+                        float* dstK = dKlocal.data() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
+                        const float* src = ctxDK.rowC.data() + (size_t)j * mHeadDim;
+                        for (int d = 0; d < mHeadDim; ++d) dstK[d] += src[d] * scale;
+                    }
+                }
+            } // for h
         }
     }
     MNN_CONCURRENCY_END();
 
-    // reduction
+    // reduction to global dK/dV
     size_t kvAll = (size_t)mKvSeq * mKvNumHead * mHeadDim;
     for (int t = 0; t < mThreads; ++t) {
         const auto& dk = dK_locals[t];
@@ -335,226 +443,12 @@ void CPUAttentionGrad::executeStreaming(const Tensor* Q, const Tensor* K, const 
     }
 }
 
-// ============== Head GEMM path (same as previous version) ==============
-void CPUAttentionGrad::executeHeadGemm(const Tensor* Q, const Tensor* K, const Tensor* V,
-                                       const Tensor* mask, const Tensor* dY,
-                                       Tensor* dQ, Tensor* dK, Tensor* dV) {
-    // (code unchanged from your earlier head GEMM implementation)
-    // For brevity, keep streaming if you only needed the fix; you can reinsert
-    // head GEMM logic here if already working previously.
-    executeStreaming(Q, K, V, mask, dY, dQ, dK, dV);
-}
-
-// ============== Group GEMM path (FIX: add Q_head / dY_head declarations) ==============
-void CPUAttentionGrad::executeGroupGemm(const Tensor* Q, const Tensor* K, const Tensor* V,
-                                        const Tensor* mask, const Tensor* dY,
-                                        Tensor* dQ, Tensor* dK, Tensor* dV) {
-    preparePackedKV(K, V);
-    auto core = static_cast<CPUBackend*>(backend())->functions();
-
-    const float* Qptr  = Q->host<float>();
-    const float* dYptr = dY->host<float>();
-    float* dQptr = dQ->host<float>();
-    float* dKptr = dK->host<float>();
-    float* dVptr = dV->host<float>();
-
-    bool hasMask = (mask != nullptr);
-    bool maskIsFloat = hasMask && (mask->getType() == halide_type_of<float>());
-    const float* maskF = (hasMask && maskIsFloat) ? mask->host<float>() : nullptr;
-    const int*   maskI = (hasMask && !maskIsFloat) ? mask->host<int>()   : nullptr;
-
-    const float scale = 1.f / std::sqrt((float)mHeadDim);
-    int groupSize = mNumHead / mKvNumHead;
-    int kvHeadsPerThread = UP_DIV(mKvNumHead, mThreads);
-
-    MNN_CONCURRENCY_BEGIN(tId, mThreads) {
-        int kvStart = (int)tId * kvHeadsPerThread;
-        int kvEnd   = std::min(kvStart + kvHeadsPerThread, mKvNumHead);
-        if (kvStart >= kvEnd) { }
-        else {
-            // Local buffers
-            std::vector<float> K_head(mKvSeq * mHeadDim);
-            std::vector<float> V_head(mKvSeq * mHeadDim);
-
-            std::vector<float> Q_group(groupSize * mSeq * mHeadDim);
-            std::vector<float> dY_group(groupSize * mSeq * mHeadDim);
-
-            // New: per-head scratch (missing before -> caused compile error)
-            std::vector<float> Q_head(mSeq * mHeadDim);
-            std::vector<float> dY_head(mSeq * mHeadDim);
-
-            std::vector<float> packA_Qgroup;
-            std::vector<float> logitsGroup(groupSize * mSeq * mKvSeq);
-            std::vector<float> probsGroup (groupSize * mSeq * mKvSeq);
-
-            std::vector<float> dQ_head(mSeq * mHeadDim);
-            std::vector<float> dK_head(mKvSeq * mHeadDim);
-            std::vector<float> dV_head(mKvSeq * mHeadDim);
-
-            std::vector<float> dP(mSeq * mKvSeq);
-            std::vector<float> dS(mSeq * mKvSeq);
-
-            std::vector<float> packA_dY(UP_DIV(mSeq, mEP) * mHeadDim * mEP);
-            std::vector<float> packA_tmp;
-            std::vector<float> Q_T(mHeadDim * mSeq);
-            std::vector<float> dY_T(mHeadDim * mSeq);
-            std::vector<float> packB_Q_T(UP_DIV(mHeadDim,4) * mSeq * 4);
-            std::vector<float> packB_dY_T(UP_DIV(mHeadDim,4) * mSeq * 4);
-            std::vector<float> PT;
-
-            GemmCtx gemmCtx; gemmCtx.eP = mEP;
-
-            for (int kv_h = kvStart; kv_h < kvEnd; ++kv_h) {
-                int hBegin = kv_h * groupSize;
-                int realGroup = std::min(groupSize, mNumHead - hBegin);
-
-                for (int j = 0; j < mKvSeq; ++j) {
-                    const float* Ks = K->host<float>() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                    const float* Vs = V->host<float>() + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                    ::memcpy(K_head.data() + j * mHeadDim, Ks, mHeadDim * sizeof(float));
-                    ::memcpy(V_head.data() + j * mHeadDim, Vs, mHeadDim * sizeof(float));
-                }
-                std::fill(dK_head.begin(), dK_head.end(), 0.f);
-                std::fill(dV_head.begin(), dV_head.end(), 0.f);
-
-                for (int g = 0; g < realGroup; ++g) {
-                    int h = hBegin + g;
-                    for (int i = 0; i < mSeq; ++i) {
-                        const float* Qi  = Qptr  + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                        const float* dYi = dYptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                        ::memcpy(Q_group.data()  + (size_t)(g * mSeq + i) * mHeadDim, Qi,  mHeadDim * sizeof(float));
-                        ::memcpy(dY_group.data() + (size_t)(g * mSeq + i) * mHeadDim, dYi, mHeadDim * sizeof(float));
-                    }
-                }
-
-                packA_Qgroup.assign(UP_DIV(realGroup * mSeq, mEP) * mHeadDim * mEP, 0.f);
-                packA(Q_group.data(), realGroup * mSeq, mHeadDim, mEP, packA_Qgroup);
-                const float* packKTHead = mPackKT->host<float>() +
-                    (size_t)kv_h * UP_DIV(mKvSeq,4) * mHeadDim * 4;
-                gemmApackedBpacked(packA_Qgroup.data(), realGroup * mSeq, mHeadDim,
-                                   packKTHead, mKvSeq, gemmCtx, core);
-                ::memcpy(logitsGroup.data(), gemmCtx.rowC.data(),
-                         (size_t)realGroup * mSeq * mKvSeq * sizeof(float));
-
-                for (int g = 0; g < realGroup; ++g) {
-                    for (int i = 0; i < mSeq; ++i) {
-                        float* row = logitsGroup.data() + (size_t)(g * mSeq + i) * mKvSeq;
-                        for (int j = 0; j < mKvSeq; ++j) {
-                            float v = row[j] * scale;
-                            if (hasMask) {
-                                if (maskIsFloat) v += maskF[i * mKvSeq + j];
-                                else v = (maskI[i * mKvSeq + j] ? v : -1e30f);
-                            }
-                            row[j] = v;
-                        }
-                        MNNSoftmax(probsGroup.data() + (size_t)(g * mSeq + i) * mKvSeq,
-                                   row, (size_t)mKvSeq);
-                    }
-                }
-
-                for (int g = 0; g < realGroup; ++g) {
-                    int h = hBegin + g;
-                    const float* packKHead  = mPackK->host<float>()  +
-                        (size_t)kv_h * UP_DIV(mHeadDim,4) * mKvSeq * 4;
-                    const float* packVTHead = mPackVT->host<float>() +
-                        (size_t)kv_h * UP_DIV(mKvSeq,4) * mHeadDim * 4;
-
-                    // Extract single head (already missing in original code)
-                    for (int i = 0; i < mSeq; ++i) {
-                        ::memcpy(dY_head.data() + i * mHeadDim,
-                                 dY_group.data() + (size_t)(g * mSeq + i) * mHeadDim,
-                                 mHeadDim * sizeof(float));
-                        ::memcpy(Q_head.data() + i * mHeadDim,
-                                 Q_group.data() + (size_t)(g * mSeq + i) * mHeadDim,
-                                 mHeadDim * sizeof(float));
-                    }
-
-                    packA(dY_head.data(), mSeq, mHeadDim, mEP, packA_dY);
-                    // dP = dY * V^T
-                    gemmApackedBpacked(packA_dY.data(), mSeq, mHeadDim, packVTHead, mKvSeq, gemmCtx, core);
-                    ::memcpy(dP.data(), gemmCtx.rowC.data(), (size_t)mSeq * mKvSeq * sizeof(float));
-
-                    // dV += P^T * dY
-                    PT.resize(mKvSeq * mSeq);
-                    for (int i = 0; i < mSeq; ++i) {
-                        const float* Prow = probsGroup.data() + (size_t)(g * mSeq + i) * mKvSeq;
-                        for (int j = 0; j < mKvSeq; ++j) PT[j * mSeq + i] = Prow[j];
-                    }
-                    packA_tmp.assign(UP_DIV(mKvSeq, mEP) * mSeq * mEP, 0.f);
-                    packA(PT.data(), mKvSeq, mSeq, mEP, packA_tmp);
-                    for (int i = 0; i < mSeq; ++i) {
-                        const float* dYi = dY_head.data() + i * mHeadDim;
-                        for (int d = 0; d < mHeadDim; ++d) dY_T[d * mSeq + i] = dYi[d];
-                    }
-                    core->MNNPackForMatMul_B(packB_dY_T.data(), dY_T.data(),
-                                             (size_t)mHeadDim, (size_t)mSeq, false);
-                    gemmApackedBpacked(packA_tmp.data(), mKvSeq, mSeq,
-                                       packB_dY_T.data(), mHeadDim, gemmCtx, core);
-                    for (int i = 0; i < mKvSeq * mHeadDim; ++i)
-                        dV_head[i] += gemmCtx.rowC[i];
-
-                    // dS
-                    for (int i = 0; i < mSeq; ++i) {
-                        const float* dPi = dP.data() + i * mKvSeq;
-                        const float* Pi  = probsGroup.data() + (size_t)(g * mSeq + i) * mKvSeq;
-                        float* dSi = dS.data() + i * mKvSeq;
-                        float sum_dP_P = 0.f;
-                        for (int j = 0; j < mKvSeq; ++j) sum_dP_P += dPi[j] * Pi[j];
-                        for (int j = 0; j < mKvSeq; ++j)
-                            dSi[j] = (dPi[j] - sum_dP_P) * Pi[j];
-                    }
-
-                    // dQ
-                    packA_tmp.assign(UP_DIV(mSeq, mEP) * mKvSeq * mEP, 0.f);
-                    packA(dS.data(), mSeq, mKvSeq, mEP, packA_tmp);
-                    gemmApackedBpacked(packA_tmp.data(), mSeq, mKvSeq,
-                                       packKHead, mHeadDim, gemmCtx, core);
-                    for (int i = 0; i < mSeq * mHeadDim; ++i)
-                        dQ_head[i] = gemmCtx.rowC[i] * scale;
-
-                    // dK
-                    PT.resize(mKvSeq * mSeq);
-                    for (int j = 0; j < mKvSeq; ++j)
-                        for (int i = 0; i < mSeq; ++i)
-                            PT[j * mSeq + i] = dS[i * mKvSeq + j];
-                    packA_tmp.assign(UP_DIV(mKvSeq, mEP) * mSeq * mEP, 0.f);
-                    packA(PT.data(), mKvSeq, mSeq, mEP, packA_tmp);
-                    for (int i = 0; i < mSeq; ++i) {
-                        const float* Qi = Q_head.data() + i * mHeadDim;
-                        for (int d = 0; d < mHeadDim; ++d) Q_T[d * mSeq + i] = Qi[d];
-                    }
-                    core->MNNPackForMatMul_B(packB_Q_T.data(), Q_T.data(),
-                                             (size_t)mHeadDim, (size_t)mSeq, false);
-                    gemmApackedBpacked(packA_tmp.data(), mKvSeq, mSeq,
-                                       packB_Q_T.data(), mHeadDim, gemmCtx, core);
-                    for (int i = 0; i < mKvSeq * mHeadDim; ++i)
-                        dK_head[i] += gemmCtx.rowC[i] * scale;
-
-                    // write dQ
-                    for (int i = 0; i < mSeq; ++i) {
-                        float* dst = dQptr + (size_t)i * mNumHead * mHeadDim + (size_t)h * mHeadDim;
-                        ::memcpy(dst, dQ_head.data() + i * mHeadDim, mHeadDim * sizeof(float));
-                    }
-                    std::fill(dQ_head.begin(), dQ_head.end(), 0.f);
-                }
-
-                // accumulate to global
-                for (int j = 0; j < mKvSeq; ++j) {
-                    float* gK = dKptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                    float* gV = dVptr + (size_t)j * mKvNumHead * mHeadDim + (size_t)kv_h * mHeadDim;
-                    axpyVec4(gK, dK_head.data() + j * mHeadDim, 1.f, mHeadDim);
-                    axpyVec4(gV, dV_head.data() + j * mHeadDim, 1.f, mHeadDim);
-                }
-            }
-        }
-    }
-    MNN_CONCURRENCY_END();
-}
 
 // ============== onExecute ==============
 ErrorCode CPUAttentionGrad::onExecute(const std::vector<Tensor*>& inputs,
                                       const std::vector<Tensor*>& outputs) {
-                                        
+    // debug entry
+    // fprintf(stderr, "[Grad] onExecute enter, inputs=%zu outputs=%zu\n", inputs.size(), outputs.size()); fflush(stderr);
     const Tensor* Q = inputs[0];
     const Tensor* K = inputs[1];
     const Tensor* V = inputs[2];
@@ -571,19 +465,11 @@ ErrorCode CPUAttentionGrad::onExecute(const std::vector<Tensor*>& inputs,
     ::memset(dK->host<void>(), 0, dK->size());
     ::memset(dV->host<void>(), 0, dV->size());
 
-    ExecPath path = selectPath();
-    switch (path) {
-        case ExecPath::GroupGemm:
-            executeGroupGemm(Q, K, V, mask, dY, dQ, dK, dV);
-            break;
-        case ExecPath::HeadGemm:
-            executeHeadGemm(Q, K, V, mask, dY, dQ, dK, dV);
-            break;
-        case ExecPath::Streaming:
-        default:
-            executeStreaming(Q, K, V, mask, dY, dQ, dK, dV);
-            break;
-    }
+
+    // fprintf(stderr, "[Grad] call executeStreaming\n"); fflush(stderr);
+    executeStreaming(Q, K, V, mask, dY, dQ, dK, dV);
+    // fprintf(stderr, "[Grad] onExecute exit\n"); fflush(stderr);
+
     return NO_ERROR;
 }
 
