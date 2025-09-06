@@ -208,9 +208,9 @@ ErrorCode CPUAttentionGrad::onResize(const std::vector<Tensor*>& inputs,
         mThreadBufs[t].packAT.reserve(needABig);
         (void)needASmall;
     }
-    // Reset dV A^T packing validation
-    mDVPackATChecked = false;
-    mDVPackATUsePackAT = false;
+    // Force enable dV A^T pack via packATranspose (skip validation)
+    mDVPackATChecked = true;
+    mDVPackATUsePackAT = true;
     return NO_ERROR;
 }
 
