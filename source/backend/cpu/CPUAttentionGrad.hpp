@@ -88,6 +88,30 @@ private:
     // Thresholds (tunable)
     static constexpr int64_t kHeadGemmThreshold  = 32 * 1024;   // seq * kv * dim
     static constexpr int64_t kGroupGemmThreshold = 96 * 1024;   // seq * kv * dim (and groupSize > 1)
+
+    // Thread-local pooled buffers to reduce realloc / memset
+    struct ThreadBuf {
+        // Packed A buffers
+        std::vector<float> packA;
+        std::vector<float> packAT;
+        // Packed B buffers for Q and dY
+        std::vector<float> packBQ;
+        std::vector<float> packBDY;
+        // Contiguous head slices
+        std::vector<float> contigQ;
+        std::vector<float> contigDY;
+        // GEMM contexts (packed C and row-major C)
+        GemmCtx ctxQK{4};
+        GemmCtx ctxDP{4};
+        GemmCtx ctxDQ{4};
+        GemmCtx ctxDV{4};
+        GemmCtx ctxDK{4};
+    };
+    std::vector<ThreadBuf> mThreadBufs;
+
+    // Heuristic switch for dV A^T packing path (validated once per resize)
+    bool mDVPackATChecked = false;
+    bool mDVPackATUsePackAT = false;
 };
 
 } // namespace MNN
